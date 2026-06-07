@@ -1,0 +1,19 @@
+@import "../../styles/variables";
+
+.alert-rules-page {
+  code {
+    background: #f5f5f5;
+    padding: 1px 4px;
+    border-radius: 3px;
+    font-size: 12px;
+    word-break: break-word;
+  }
+
+  .p-tag {
+    font-size: 12px;
+  }
+
+  .preview-table .p-datatable-tbody td {
+    font-size: 12px;
+  }
+}

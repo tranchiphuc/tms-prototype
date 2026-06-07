@@ -1,0 +1,32 @@
+I. The alert module must have followings feature:
+- Rule Evaluation Engine
+- Deduplication Logic
+- Alert History & Audit Log
+
+
+II. Another application called NOC PRO performs other features of alerting including: 
+- Escalation Engine
+- Notification Delivery
+- Silence / Inhibition
+We do not design the hand-shake working ways between this alert module with NOC Pro right now, we design it later.
+
+III. Design keys:
+1. Alerting latency SLO: 5–30 seconds (fast)
+2. Rule management: Dynamic rules via a UI/API (operators can create/edit rules at runtime)
+3. Metric name: Metric is renamed at Flink via Flink rule in flink_rules table schema. The metric_alias (name of metric) is unique, and can be used across.
+4. Alert rule:
+4.1. Basic alert rules: 
+Basic alert rule compare bucket aggregate 5-minute value with
+- Type A: predefined threshold, 
+- Type B: percent change compared with historial bucket aggregate value (yesterday, 3 day ago, lastweek ... that we can define)
+- Type C: AVG (or MAX) of 1 hour ago, 24 hour ago, 3 day ago, 7 day ago (we can define the duration).
+But basic rule fires alarm only if continuous predefined N bukets breach condition. N may be different for each type of resources (interface, CPU, RAM, queue, packer error ...). Alarm is clear if all N continuous bucket do not breach the condition anymore.
+4.2. Composite rule:
+- Composite rule contains multiple basic alert rules via AND, OR operators. 
+- All the basic rules in a composite rule must be in the same scope of device. We mostly use composite rule for the traffic of the same interface id of device to use basic rule of type A, B, C. Can you check if we can generalize composite rule for other resources as well.  
+
+5. Other information:
+- Alert rule volume & firing rate: Roughly how many active alert rules do you expect, and during a major network incident, what's the approximate firing rate? -> Medium: 500–2,000 rules, 100–1,000 alerts/hour
+- Deduplication window: When the same condition fires repeatedly (e.g., an interface flapping up/down), how long should the system suppress re-firing the same alert before notifying NOC PRO again? -> Configurable per rule (default 120 minutes)
+- Audit log retention: 90 days
+- Each metric is stored as metric_alias and path_alias in MariaDB as attached schema.

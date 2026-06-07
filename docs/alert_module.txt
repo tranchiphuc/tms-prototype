@@ -1,0 +1,25 @@
+I. The alert module must have followings feature:
+- Rule Evaluation Engine
+- Deduplication Logic
+- Alert History & Audit Log
+
+
+II. Another application called NOC PRO performs other features of alerting including: 
+- Escalation Engine
+- Notification Delivery
+- Silence / Inhibition
+
+
+III. Design keys:
+1. Alerting latency SLO: 5–30 seconds (fast)
+2. Rule management: Dynamic rules via a UI/API (operators can create/edit rules at runtime)
+3. Metric name: Metric is renamed at Flink via Flink rule in flink_rules table schema. The metric_alias (name of metric) is unique, and can be used across. Devired metrics can be created from renamed metrics
+4. Supporting avanced alert rule:
+- Basic alert rule that compare value with threshold, or percent change compared with historial value (previous sample)
+- Composite rule contains multiple basic alert rules via AND, OR operators, apply for same level of device, for example, same interface id or same cpu id
+5. Other information:
+- Alert rule volume & firing rate: Roughly how many active alert rules do you expect, and during a major network incident, what's the approximate firing rate? -> Medium: 500–2,000 rules, 100–1,000 alerts/hour
+- Deduplication window: When the same condition fires repeatedly (e.g., an interface flapping up/down), how long should the system suppress re-firing the same alert before notifying NOC PRO again? -> Configurable per rule (default 60 minutes)
+- Audit log retention: 90 days
+- Each metric is stored as metric_alias and path_alias in MariaDB as attached schema.
+6. Visualization: Operator can view alarms in dashboard.

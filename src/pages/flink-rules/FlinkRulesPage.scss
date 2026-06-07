@@ -1,0 +1,22 @@
+@import "../../styles/variables";
+
+.flink-rules-page {
+  .p-tabview-nav {
+    font-size: 13px;
+  }
+
+  .p-tabview-panels {
+    padding: 16px 0 0;
+  }
+
+  // ConfirmDialog message giữ xuống dòng (cascade list)
+  .p-confirm-dialog-message {
+    white-space: pre-line;
+  }
+
+  code {
+    background: #f5f5f5;
+    padding: 1px 4px;
+    border-radius: 3px;
+  }
+}

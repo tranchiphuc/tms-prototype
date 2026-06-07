@@ -1,0 +1,1466 @@
+// ============================================================
+// NetStream (TMS) — Combined MariaDB + ClickHouse Schema
+// dbdiagram.io DBML  |  Version 4.0.1  |  June 2026
+//
+// Prefix convention: ALL tables prefixed with "tlm_"
+//
+// v4.0.1 refinements:
+//   - tlm_active_alerts: added idx_last_fired_at for recent-alert queries.
+//   - tlm_grafana_dashboard_map: added 'enabled' toggle per resource mapping.
+//
+// Databases:
+//   [mariadb]    — operational / transactional data
+//   [clickhouse] — telemetry & analytics, append-only / time-series
+//
+// Architecture (v4.0):
+//   Source      : 300 routers (Cisco / Juniper / Nokia), gNMI Dial-In only
+//   Ingestion   : 3 × gNMIc instances running in CLUSTER MODE
+//                 (Consul as distributed locker + service discovery)
+//   Queueing    : 3 × Kafka brokers
+//   Processing  : Apache Flink — normalize, alias, filter → ClickHouse
+//   Storage     : ClickHouse (metrics + utilization + alert history)
+//                 MariaDB (config, rules, YANG library, users)
+//   Services    : Resource Utilization Service (Spring Boot)
+//                 Alert Engine (Spring Boot + Redis)
+//
+// Changes v4.0 vs v3.0:
+//   REMOVED  : agent_instances, telegraf_instances (Telegraf dropped)
+//   REMOVED  : gnmic_instances (replaced by cluster model)
+//   REMOVED  : routers.oper_mode (only gNMI Dial-In remains)
+//   REMOVED  : flink_rules (replaced by 4 independent rule tables)
+//   REMOVED  : metric_aliases, path_aliases (old schema, replaced)
+//   REMOVED  : alert_rules, alert_rule_scopes, alert_rule_channels (old simple model)
+//   REMOVED  : active_alerts (replaced by tlm_active_alerts)
+//   REMOVED  : notification_history (belongs to NOC PRO scope)
+//   REMOVED  : alert_history ClickHouse (replaced by tlm_alert_history)
+//   ADDED    : tlm_gnmic_cluster_config, tlm_gnmic_instances, tlm_consul_config
+//   ADDED    : tlm_revision_counter, tlm_path_aliases, tlm_metric_aliases,
+//              tlm_label_aliases, tlm_filter_rules  (Flink rule pipeline v4.1)
+//   ADDED    : tlm_util_binding + 5 resource config tables (Utilization Service)
+//   ADDED    : tlm_util_resource_config (N consecutive buckets)
+//   ADDED    : tlm_alert_rule, tlm_alert_rule_condition, tlm_alert_rule_audit,
+//              tlm_alert_rule_channels, tlm_notification_channels (Alert Engine v5.0)
+//   ADDED    : tlm_active_alerts (live alert tracking)
+//   ADDED    : tlm_service_config (T_poll, T_cycle, retention settings)
+//   ADDED    : tlm_grafana_dashboard_map (per-resource Grafana deep-link mapping)
+//   MODIFIED : tlm_routers (removed oper_mode/agent_instance_id, added gnmi fields)
+//   MODIFIED : tlm_credentials (gNMI Dial-In only, removed Dial-Out fields)
+//   MODIFIED : tlm_kafka_config (json→json/proto encoding)
+//   MODIFIED : tlm_profile_associations (removed agent_type, aligned to cluster)
+//   ClickHouse NEW:
+//              tlm_metrics (v4.1 + device_name)
+//              tlm_metrics_raw (7-day TTL)
+//              tlm_path_aliases_mirror, tlm_metric_aliases_mirror,
+//              tlm_label_aliases_mirror, tlm_filter_rules_mirror
+//              tlm_alert_history
+//              tlm_if_utilization, tlm_cpu_utilization, tlm_mem_utilization,
+//              tlm_queue_utilization, tlm_packet_error_utilization
+//              5-min and hourly MV tables (15 tables)
+//
+// Paste this entire file into dbdiagram.io → Import → DBML
+// ============================================================
+
+
+// ============================================================
+// DATABASE GROUP: ClickHouse  (append-only / time-series)
+// ============================================================
+
+TableGroup clickhouse_telemetry {
+  tlm_metrics
+  tlm_metrics_raw
+}
+
+TableGroup clickhouse_rule_mirrors {
+  tlm_path_aliases_mirror
+  tlm_metric_aliases_mirror
+  tlm_label_aliases_mirror
+  tlm_filter_rules_mirror
+}
+
+TableGroup clickhouse_utilization_raw {
+  tlm_if_utilization
+  tlm_cpu_utilization
+  tlm_mem_utilization
+  tlm_queue_utilization
+  tlm_packet_error_utilization
+}
+
+TableGroup clickhouse_utilization_5min {
+  tlm_if_util_5min
+  tlm_cpu_util_5min
+  tlm_mem_util_5min
+  tlm_queue_util_5min
+  tlm_packet_error_util_5min
+}
+
+TableGroup clickhouse_utilization_hourly {
+  tlm_if_util_hourly
+  tlm_cpu_util_hourly
+  tlm_mem_util_hourly
+  tlm_queue_util_hourly
+  tlm_packet_error_util_hourly
+}
+
+TableGroup clickhouse_alerts {
+  tlm_alert_history
+}
+
+
+// ------------------------------------------------------------
+// tlm_metrics
+// Main processed metrics table. Written by Flink Job #1.
+// Engine: MergeTree()
+// Partition: toYYYYMMDD(event_time)
+// Order: (metric_name, device_id, path_id, event_time)
+// TTL: event_time + INTERVAL 90 DAY (configurable via tlm_clickhouse_config)
+// ------------------------------------------------------------
+Table tlm_metrics {
+  event_time      DateTime64_3   [not null, note: "Router sample timestamp (nanoseconds converted to ms). Timezone: Asia/Ho_Chi_Minh."]
+  receive_time    DateTime64_3   [not null, note: "Flink processing timestamp (wall clock)."]
+  device_id       UInt32         [not null, note: "Logic-FK → cat_device.device_id (external catalog). 0 = router not yet registered."]
+  device_name     LowCardinality_String [not null, note: "Denormalized from cat_device.device_name at ingest time by Flink. ~300 distinct values → LowCardinality dictionary encoding. Empty string when device_id=0. NOT in ORDER BY."]
+  path_id         UInt32         [not null, note: "= tlm_path_aliases.id (MariaDB / mirror). 0 = no PathRename rule matched."]
+  raw_path        String         [not null, note: "Original YANG sensor path before PathRename. Always stored."]
+  raw_metric_name String         [not null, note: "Original YANG leaf name before FieldRename. Always stored."]
+  metric_name     LowCardinality_String [not null, note: "Metric name after FieldRename. Fallback = raw_metric_name if no rule matched."]
+  value_type      UInt8          [not null, note: "1=number (read value_number), 2=string (read value_string), 3=bool (read value_bool)."]
+  unit            LowCardinality_String [not null, note: "Standardized unit (UCUM) from metric_aliases.target_unit. Empty string when value_type ∈ {2,3}."]
+  value_number    Float64        [not null, note: "Numeric value after transform. Read when value_type=1."]
+  value_string    String         [not null, note: "String value after enum_mapping. Read when value_type=2."]
+  value_bool      Bool           [not null, note: "Bool value. Read when value_type=3."]
+  labels          Map_String     [not null, note: "Map(LowCardinality(String), String). Tags after LabelKeyRename — keys are canonical (e.g. if_name instead of interface_name/interface/if-name)."]
+
+  note: "Primary processed telemetry table. Written by Flink Job #1 after applying all alias and filter rules. Partitioned daily. ORDER BY (metric_name, device_id, path_id, event_time) optimises alert engine scans (metric-first) and per-device queries. device_name denormalized to avoid JOIN cat_device on every dashboard query. Cross-DB logic-FKs to cat_device and tlm_path_aliases enforced at app layer only."
+}
+
+// ------------------------------------------------------------
+// tlm_metrics_raw
+// Raw Flink ingest buffer (JSON payload). 7-day TTL.
+// Engine: MergeTree()
+// Partition: toYYYYMMDD(ingest_time)
+// Order: ingest_time
+// TTL: ingest_time + INTERVAL 7 DAY
+// ------------------------------------------------------------
+Table tlm_metrics_raw {
+  ingest_time   DateTime64_3  [not null, note: "Wall-clock time when Flink received message from Kafka."]
+  raw_payload   String        [not null, note: "Raw gNMIc JSON payload. Query with JSONExtract*() functions."]
+
+  note: "Raw ingest buffer for debug and replay. Written by Flink BEFORE alias/rename rules are applied. 7-day TTL. Partitioned daily for clean TTL pruning. No Kafka offset stored — use consumer group offset or kafka-console-consumer for exact replay."
+}
+
+// ------------------------------------------------------------
+// tlm_path_aliases_mirror  (ClickHouse mirror of MariaDB tlm_path_aliases)
+// Engine: ReplacingMergeTree(revision)
+// Order: (id)
+// Sync: pushed when MariaDB.tlm_path_aliases.pushed_at IS NULL
+// ------------------------------------------------------------
+Table tlm_path_aliases_mirror {
+  id            UInt32                [not null, note: "= MariaDB tlm_path_aliases.id"]
+  vendor_code   LowCardinality_String [not null]
+  original_path String                [not null]
+  alias_path    String                [not null]
+  status        UInt8                 [not null, note: "1=Active, 0=Deprecated."]
+  revision      UInt64                [not null, note: "ReplacingMergeTree version key. Higher revision wins on merge."]
+  updated_at    DateTime64_3          [not null, note: "Sync job insert time (NOT MariaDB.updated_at)."]
+
+  note: "Read-only mirror of MariaDB tlm_path_aliases. Used by Grafana dashboard JOINs to display alias_path alongside metric data. ReplacingMergeTree deduplicates by id; latest revision wins. Always query with FINAL modifier or argMax(alias_path, revision) pattern."
+}
+
+// ------------------------------------------------------------
+// tlm_metric_aliases_mirror  (ClickHouse mirror of MariaDB tlm_metric_aliases)
+// Engine: ReplacingMergeTree(revision)
+// Order: (id)
+// ------------------------------------------------------------
+Table tlm_metric_aliases_mirror {
+  id                   UInt32                [not null]
+  vendor_code          LowCardinality_String [not null]
+  path_alias_id        UInt32                [note: "Nullable. 0 = any-path scope."]
+  original_name        String                [not null]
+  alias_metric         LowCardinality_String [not null]
+  value_type_override  UInt8                 [note: "Nullable. 0=none, 1=number, 2=string, 3=bool."]
+  source_unit          LowCardinality_String [not null]
+  target_unit          LowCardinality_String [not null]
+  transform_kind       UInt8                 [not null, note: "0=identity, 1=linear, 2=expression, 3=enum_mapping."]
+  scale_factor         Float64               [not null]
+  offset_value         Float64               [not null]
+  transform_expression String                [not null]
+  enum_mapping         String                [not null, note: "JSON text when transform_kind=3."]
+  priority             UInt16                [not null]
+  status               UInt8                 [not null]
+  revision             UInt64                [not null]
+  updated_at           DateTime64_3          [not null]
+
+  note: "Read-only mirror of MariaDB tlm_metric_aliases. Enables dashboard queries to JOIN alias metadata. ReplacingMergeTree by id + revision."
+}
+
+// ------------------------------------------------------------
+// tlm_label_aliases_mirror  (ClickHouse mirror of MariaDB tlm_label_aliases)
+// Engine: ReplacingMergeTree(revision)
+// Order: (id)
+// ------------------------------------------------------------
+Table tlm_label_aliases_mirror {
+  id            UInt32                [not null]
+  vendor_code   LowCardinality_String [not null]
+  path_alias_id UInt32                [note: "Nullable. 0 = any-path scope."]
+  original_key  String                [not null]
+  alias_key     String                [not null]
+  lv_kind       UInt8                 [not null, note: "0=identity, 1=regex, 2=enum_mapping."]
+  lv_pattern    String                [not null]
+  lv_replace    String                [not null]
+  lv_mapping    String                [not null, note: "JSON text when lv_kind=2."]
+  priority      UInt16                [not null]
+  status        UInt8                 [not null]
+  revision      UInt64                [not null]
+  updated_at    DateTime64_3          [not null]
+
+  note: "Read-only mirror of MariaDB tlm_label_aliases."
+}
+
+// ------------------------------------------------------------
+// tlm_filter_rules_mirror  (ClickHouse mirror of MariaDB tlm_filter_rules)
+// Engine: ReplacingMergeTree(revision)
+// Order: (id)
+// ------------------------------------------------------------
+Table tlm_filter_rules_mirror {
+  id                 UInt32                [not null]
+  vendor_code        LowCardinality_String [not null]
+  match_path         String                [not null]
+  match_metric       String                [not null]
+  filter_expression  String                [not null]
+  filter_action      UInt8                 [not null, note: "0=EXCLUDE_IF_MATCH, 1=INCLUDE_IF_MATCH."]
+  priority           UInt16                [not null]
+  status             UInt8                 [not null]
+  revision           UInt64                [not null]
+  updated_at         DateTime64_3          [not null]
+
+  note: "Read-only mirror of MariaDB tlm_filter_rules."
+}
+
+// ------------------------------------------------------------
+// tlm_alert_history
+// Fired alert audit log written by Alert Engine every cycle.
+// Includes FIRED, SUPPRESSED, CLEARED events.
+// Engine: MergeTree()
+// Partition: toYYYYMMDD(fired_at)
+// Order: (rule_id, device_id, fired_at)
+// TTL: fired_at + INTERVAL 90 DAY
+// ------------------------------------------------------------
+Table tlm_alert_history {
+  fired_at             DateTime64_3          [not null, note: "Timestamp when Alert Engine processed this evaluation result (after dedup)."]
+  rule_id              UInt32                [not null, note: "Logic-FK → MariaDB tlm_alert_rule.id."]
+  rule_name            LowCardinality_String [not null, note: "Snapshot at fire time — preserved even if rule is later renamed."]
+  severity             UInt8                 [not null, note: "0=Info, 1=Warning, 2=Major, 3=Critical, 4=Error."]
+  device_id            UInt32                [not null]
+  device_name          LowCardinality_String [not null]
+  resource_type        LowCardinality_String [not null, note: "interface | cpu | memory | queue | packet_error."]
+  dimension_key        String                [not null, note: "Concatenated dimension string, e.g. 'if_name=GE0/0/0|queue_id=2'."]
+  triggered_value      Float64               [not null, note: "Actual metric value that triggered the rule."]
+  threshold_value      Float64               [not null, note: "Configured threshold. For composite rules: value of the primary condition."]
+  baseline_value       Float64               [note: "Nullable Float64. Type B: historical value. Type C: aggregate baseline. NULL for Type A."]
+  condition_snapshot   String                [not null, note: "JSON snapshot of rule + conditions at fire time. Preserves combinator, operator, thresholds even if rule is later edited."]
+  dedup_window_seconds UInt32                [not null]
+  is_first_in_window   UInt8                 [not null, note: "1 = first fire in dedup window (emitted to Kafka). 0 = suppressed (audit only)."]
+  state                LowCardinality_String [not null, note: "FIRED | SUPPRESSED | CLEARED."]
+
+  note: "Append-only fired alert audit log. Written by Alert Engine every evaluation cycle for ALL matching dimensions (including suppressed). FIRED + CLEARED events are also emitted to Kafka topic fired_alerts for NOC PRO consumption. 90-day TTL. Drives AL-10 (history view), AL-12 (top noisy rules), MTTR analysis."
+}
+
+// ------------------------------------------------------------
+// tlm_if_utilization  — Interface Traffic utilization (raw, 300s buckets)
+// Engine: MergeTree()
+// Partition: toYYYYMMDD(event_time)
+// Order: (device_id, if_name, event_time)
+// TTL: 90 days
+// ------------------------------------------------------------
+Table tlm_if_utilization {
+  event_time      DateTime64_3          [not null, note: "Window end time of the sample."]
+  device_id       UInt32                [not null]
+  device_name     LowCardinality_String [not null]
+  if_name         LowCardinality_String [not null, note: "Canonical interface name (after Label Alias by Flink Job #1)."]
+  if_speed_mbps   UInt32                [not null, note: "Interface capacity at measurement time, in Mbps. Stored per row for historical accuracy."]
+  rate_in_mbps    Float32               [not null, note: "Ingress rate (Mbps)."]
+  rate_out_mbps   Float32               [not null, note: "Egress rate (Mbps)."]
+  util_in_pct     Float32               [not null, note: "rate_in_mbps / if_speed_mbps × 100."]
+  util_out_pct    Float32               [not null, note: "rate_out_mbps / if_speed_mbps × 100."]
+  util_max_pct    Float32               [not null, note: "max(util_in_pct, util_out_pct). Useful for duplex alerts."]
+  window_seconds  UInt16                [not null, note: "Length of the computation window in seconds."]
+
+  note: "Interface bandwidth utilization records. Written by Resource Utilization Service (Spring Boot) every T_poll seconds (default 300s). Computed from tlm_metrics delta counters (if_in_octets / if_out_octets) joined with cat_interface.SPEED. Source for tlm_if_util_5min and tlm_if_util_hourly Materialized Views."
+}
+
+// ------------------------------------------------------------
+// tlm_cpu_utilization  — CPU utilization
+// Engine: MergeTree(), Partition: toYYYYMMDD(event_time)
+// Order: (device_id, cpu_id, event_time), TTL: 90 days
+// ------------------------------------------------------------
+Table tlm_cpu_utilization {
+  event_time     DateTime64_3          [not null]
+  device_id      UInt32                [not null]
+  device_name    LowCardinality_String [not null]
+  cpu_id         LowCardinality_String [not null, note: "CPU index or 'total' if metric represents the whole router."]
+  util_pct       Float32               [not null, note: "CPU utilization %. Capacity always = 100%."]
+  window_seconds UInt16                [not null]
+
+  note: "CPU utilization records. Capacity is always hardcoded to 100% (metric is already a gauge %). Source for tlm_cpu_util_5min and tlm_cpu_util_hourly MVs."
+}
+
+// ------------------------------------------------------------
+// tlm_mem_utilization  — Memory utilization
+// Engine: MergeTree(), Partition: toYYYYMMDD(event_time)
+// Order: (device_id, pool_name, event_time), TTL: 90 days
+// ------------------------------------------------------------
+Table tlm_mem_utilization {
+  event_time     DateTime64_3          [not null]
+  device_id      UInt32                [not null]
+  device_name    LowCardinality_String [not null]
+  pool_name      LowCardinality_String [not null, note: "Memory pool name or 'total'."]
+  used_bytes     UInt64                [not null, note: "Bytes in use. 0 when capacity_kind=percent_gauge."]
+  total_bytes    UInt64                [not null, note: "Total capacity in bytes. 0 when capacity_kind=percent_gauge."]
+  util_pct       Float32               [not null, note: "used_bytes / total_bytes × 100, or percent gauge value directly."]
+  window_seconds UInt16                [not null]
+
+  note: "Memory utilization records. Supports two modes: (A) router emits used+total bytes (capacity_kind=metric_total); (B) router emits % directly (capacity_kind=percent_gauge). Source for tlm_mem_util_5min and tlm_mem_util_hourly MVs."
+}
+
+// ------------------------------------------------------------
+// tlm_queue_utilization  — Queue drop rate
+// Engine: MergeTree(), Partition: toYYYYMMDD(event_time)
+// Order: (device_id, if_name, queue_id, event_time), TTL: 90 days
+// ------------------------------------------------------------
+Table tlm_queue_utilization {
+  event_time     DateTime64_3          [not null]
+  device_id      UInt32                [not null]
+  device_name    LowCardinality_String [not null]
+  if_name        LowCardinality_String [not null, note: "Interface containing the queue."]
+  queue_id       LowCardinality_String [not null, note: "Queue name / ID."]
+  drop_pkts      UInt64                [not null, note: "Packets dropped in this window."]
+  total_pkts     UInt64                [not null, note: "Total packets in this window."]
+  drop_pct       Float32               [not null, note: "drop_pkts / total_pkts × 100."]
+  window_seconds UInt16                [not null]
+
+  note: "Queue drop rate records. Source for tlm_queue_util_5min and tlm_queue_util_hourly MVs."
+}
+
+// ------------------------------------------------------------
+// tlm_packet_error_utilization  — Packet Error Rate (tall format)
+// Engine: MergeTree(), Partition: toYYYYMMDD(event_time)
+// Order: (device_id, if_name, metric_alias, event_time), TTL: 90 days
+// TALL FORMAT: 1 row per metric per interface (not wide/columnar).
+// Supports any OpenConfig interface counter under
+//   /interfaces/interface/state/counters/*
+// ------------------------------------------------------------
+Table tlm_packet_error_utilization {
+  event_time     DateTime64_3          [not null, note: "Window end time."]
+  device_id      UInt32                [not null]
+  device_name    LowCardinality_String [not null]
+  if_name        LowCardinality_String [not null]
+  metric_alias   LowCardinality_String [not null, note: "Normalized metric name from Flink (e.g. in_errors, out_discards, in_fcs_errors). Cardinality bounded by alias library."]
+  value_eps      Float64               [not null, note: "Error rate in packets/second (eps). Counter mode: delta_count / actual_seconds. Gauge rate mode: raw value."]
+  window_seconds UInt16                [not null]
+
+  note: "Packet error rate utilization in tall format. Each metric_alias is a separate row. Operator binds any OpenConfig counter alias to this resource type. metric_alias added to ORDER BY because tall format creates multiple series per (device, interface). Source for tlm_packet_error_util_5min and tlm_packet_error_util_hourly MVs."
+}
+
+// ------------------------------------------------------------
+// 5-Minute Materialized Views (AggregatingMergeTree)
+// Written automatically ON INSERT to the raw utilization tables.
+// Bucket: toStartOfFiveMinute(event_time)
+// Used by: Alert Engine for N-consecutive bucket evaluation.
+// ------------------------------------------------------------
+Table tlm_if_util_5min {
+  bucket_5min       DateTime              [not null, note: "toStartOfFiveMinute(event_time). The 5-min aggregation bucket."]
+  device_id         UInt32                [not null]
+  device_name       LowCardinality_String [not null]
+  if_name           LowCardinality_String [not null]
+  if_speed_mbps     UInt32                [not null, note: "argMax(if_speed_mbps, event_time) — latest speed in bucket."]
+  util_in_pct_avg   AggState_Float32      [not null, note: "AggregateFunction(avg, Float32). Read with avgMerge()."]
+  util_in_pct_max   AggState_Float32      [not null, note: "AggregateFunction(max, Float32). Read with maxMerge()."]
+  util_out_pct_avg  AggState_Float32      [not null]
+  util_out_pct_max  AggState_Float32      [not null]
+  util_max_pct_max  AggState_Float32      [not null]
+  rate_in_mbps_avg  AggState_Float32      [not null]
+  rate_in_mbps_max  AggState_Float32      [not null]
+  rate_out_mbps_avg AggState_Float32      [not null]
+  rate_out_mbps_max AggState_Float32      [not null]
+  sample_count      AggState_UInt64       [not null, note: "AggregateFunction(count, UInt64)."]
+
+  note: "5-min aggregation MV for interface utilization. ENGINE = AggregatingMergeTree(). ORDER BY (device_id, if_name, bucket_5min). Triggered ON INSERT INTO tlm_if_utilization. Alert Engine fetches N or N+1 or 2N buckets for Type A / Type B / Type C rules. Always query with avgMerge()/maxMerge() + GROUP BY."
+}
+
+Table tlm_cpu_util_5min {
+  bucket_5min    DateTime              [not null]
+  device_id      UInt32                [not null]
+  device_name    LowCardinality_String [not null]
+  cpu_id         LowCardinality_String [not null]
+  util_pct_avg   AggState_Float32      [not null]
+  util_pct_max   AggState_Float32      [not null]
+  sample_count   AggState_UInt64       [not null]
+
+  note: "5-min aggregation MV for CPU utilization. ENGINE = AggregatingMergeTree(). ORDER BY (device_id, cpu_id, bucket_5min)."
+}
+
+Table tlm_mem_util_5min {
+  bucket_5min    DateTime              [not null]
+  device_id      UInt32                [not null]
+  device_name    LowCardinality_String [not null]
+  pool_name      LowCardinality_String [not null]
+  util_pct_avg   AggState_Float32      [not null]
+  util_pct_max   AggState_Float32      [not null]
+  used_bytes_avg AggState_UInt64       [not null]
+  used_bytes_max AggState_UInt64       [not null]
+  sample_count   AggState_UInt64       [not null]
+
+  note: "5-min aggregation MV for memory utilization. ENGINE = AggregatingMergeTree(). ORDER BY (device_id, pool_name, bucket_5min)."
+}
+
+Table tlm_queue_util_5min {
+  bucket_5min    DateTime              [not null]
+  device_id      UInt32                [not null]
+  device_name    LowCardinality_String [not null]
+  if_name        LowCardinality_String [not null]
+  queue_id       LowCardinality_String [not null]
+  drop_pct_avg   AggState_Float32      [not null]
+  drop_pct_max   AggState_Float32      [not null]
+  sample_count   AggState_UInt64       [not null]
+
+  note: "5-min aggregation MV for queue drop rate. ENGINE = AggregatingMergeTree(). ORDER BY (device_id, if_name, queue_id, bucket_5min)."
+}
+
+Table tlm_packet_error_util_5min {
+  bucket_5min    DateTime              [not null]
+  device_id      UInt32                [not null]
+  device_name    LowCardinality_String [not null]
+  if_name        LowCardinality_String [not null]
+  metric_alias   LowCardinality_String [not null, note: "Tall format: metric_alias in ORDER BY for per-series aggregation."]
+  value_eps_avg  AggState_Float64      [not null]
+  value_eps_max  AggState_Float64      [not null]
+  sample_count   AggState_UInt64       [not null]
+
+  note: "5-min aggregation MV for packet error rate. Tall format — metric_alias in ORDER BY. ENGINE = AggregatingMergeTree(). ORDER BY (device_id, if_name, metric_alias, bucket_5min). TTL: 90 days."
+}
+
+// ------------------------------------------------------------
+// Hourly Materialized Views (AggregatingMergeTree)
+// Triggered ON INSERT to the raw utilization tables (independently from 5-min MVs).
+// Bucket: toStartOfHour(event_time)
+// Used by: Alert Engine (Type C window aggregate — 1h/24h/7d baseline).
+//          Dashboard trend charts (per-hour over multiple days).
+// ------------------------------------------------------------
+Table tlm_if_util_hourly {
+  hour_time         DateTime              [not null, note: "toStartOfHour(event_time)."]
+  device_id         UInt32                [not null]
+  device_name       LowCardinality_String [not null]
+  if_name           LowCardinality_String [not null]
+  if_speed_mbps     UInt32                [not null, note: "argMax(if_speed_mbps, event_time)."]
+  util_in_pct_avg   AggState_Float32      [not null]
+  util_in_pct_max   AggState_Float32      [not null]
+  util_in_pct_min   AggState_Float32      [not null]
+  util_out_pct_avg  AggState_Float32      [not null]
+  util_out_pct_max  AggState_Float32      [not null]
+  util_out_pct_min  AggState_Float32      [not null]
+  util_max_pct_max  AggState_Float32      [not null]
+  sample_count      AggState_UInt64       [not null, note: "Detect hours with missing data."]
+
+  note: "Hourly rollup MV for interface utilization. ENGINE = AggregatingMergeTree(). ORDER BY (device_id, if_name, hour_time). TTL: 90 days. Used for Alert Type C baseline (AVG/MAX over 24h or 7d) and dashboard hourly trend charts."
+}
+
+Table tlm_cpu_util_hourly {
+  hour_time      DateTime              [not null]
+  device_id      UInt32                [not null]
+  device_name    LowCardinality_String [not null]
+  cpu_id         LowCardinality_String [not null]
+  util_pct_avg   AggState_Float32      [not null]
+  util_pct_max   AggState_Float32      [not null]
+  util_pct_min   AggState_Float32      [not null]
+  sample_count   AggState_UInt64       [not null]
+
+  note: "Hourly rollup MV for CPU utilization. ENGINE = AggregatingMergeTree(). ORDER BY (device_id, cpu_id, hour_time). TTL: 90 days."
+}
+
+Table tlm_mem_util_hourly {
+  hour_time      DateTime              [not null]
+  device_id      UInt32                [not null]
+  device_name    LowCardinality_String [not null]
+  pool_name      LowCardinality_String [not null]
+  util_pct_avg   AggState_Float32      [not null]
+  util_pct_max   AggState_Float32      [not null]
+  util_pct_min   AggState_Float32      [not null]
+  used_bytes_avg AggState_UInt64       [not null]
+  used_bytes_max AggState_UInt64       [not null]
+  sample_count   AggState_UInt64       [not null]
+
+  note: "Hourly rollup MV for memory utilization. ENGINE = AggregatingMergeTree(). ORDER BY (device_id, pool_name, hour_time). TTL: 90 days."
+}
+
+Table tlm_queue_util_hourly {
+  hour_time      DateTime              [not null]
+  device_id      UInt32                [not null]
+  device_name    LowCardinality_String [not null]
+  if_name        LowCardinality_String [not null]
+  queue_id       LowCardinality_String [not null]
+  drop_pct_avg   AggState_Float32      [not null]
+  drop_pct_max   AggState_Float32      [not null]
+  drop_pct_min   AggState_Float32      [not null]
+  sample_count   AggState_UInt64       [not null]
+
+  note: "Hourly rollup MV for queue drop rate. ENGINE = AggregatingMergeTree(). ORDER BY (device_id, if_name, queue_id, hour_time). TTL: 90 days."
+}
+
+Table tlm_packet_error_util_hourly {
+  hour_time      DateTime              [not null]
+  device_id      UInt32                [not null]
+  device_name    LowCardinality_String [not null]
+  if_name        LowCardinality_String [not null]
+  metric_alias   LowCardinality_String [not null]
+  value_eps_avg  AggState_Float64      [not null]
+  value_eps_max  AggState_Float64      [not null]
+  value_eps_min  AggState_Float64      [not null]
+  sample_count   AggState_UInt64       [not null]
+
+  note: "Hourly rollup MV for packet error rate (tall format). ENGINE = AggregatingMergeTree(). ORDER BY (device_id, if_name, metric_alias, hour_time). TTL: 90 days."
+}
+
+// Cross-DB logical references (not expressible as DBML Refs):
+//   tlm_metrics.device_id              → [external] cat_device.device_id
+//   tlm_metrics.path_id                → [mariadb] tlm_path_aliases.id
+//   tlm_alert_history.rule_id          → [mariadb] tlm_alert_rule.id
+//   tlm_*_utilization.device_id        → [external] cat_device.device_id
+//   tlm_if_utilization.if_name         → [external] cat_interface.INTERFACE_NAME (catalog)
+//   tlm_path_aliases_mirror.id         → [mariadb] tlm_path_aliases.id
+//   tlm_metric_aliases_mirror.id       → [mariadb] tlm_metric_aliases.id
+
+
+// ============================================================
+// DATABASE GROUP: MariaDB  (operational / transactional)
+// ============================================================
+
+TableGroup mariadb_infrastructure {
+  tlm_gnmic_cluster_config
+  tlm_gnmic_instances
+  tlm_consul_config
+}
+
+TableGroup mariadb_routers {
+  tlm_routers
+}
+
+TableGroup mariadb_profiles {
+  tlm_profiles
+  tlm_yang_paths
+  tlm_profile_sensors
+  tlm_profile_associations
+}
+
+TableGroup mariadb_flink_rules {
+  tlm_revision_counter
+  tlm_path_aliases
+  tlm_metric_aliases
+  tlm_label_aliases
+  tlm_filter_rules
+}
+
+TableGroup mariadb_utilization {
+  tlm_util_binding
+  tlm_util_if_config
+  tlm_util_cpu_config
+  tlm_util_mem_config
+  tlm_util_queue_config
+  tlm_util_packet_error_config
+  tlm_util_resource_config
+}
+
+TableGroup mariadb_alerts {
+  tlm_alert_rule
+  tlm_alert_rule_condition
+  tlm_alert_rule_audit
+  tlm_notification_channels
+  tlm_alert_rule_channels
+  tlm_active_alerts
+}
+
+TableGroup mariadb_users_audit {
+  tlm_users
+  tlm_audit_log
+}
+
+TableGroup mariadb_settings {
+  tlm_credentials
+  tlm_kafka_config
+  tlm_clickhouse_config
+  tlm_grafana_config
+  tlm_grafana_dashboard_map
+  tlm_service_config
+}
+
+TableGroup mariadb_yang {
+  tlm_yang_version_bundles
+  tlm_yang_models
+  tlm_yang_nodes
+}
+
+
+// ============================================================
+// DOMAIN 1: INFRASTRUCTURE — gNMIc Cluster
+// ============================================================
+
+// ------------------------------------------------------------
+// tlm_gnmic_cluster_config  (singleton, id=0)
+// Global gNMIc cluster parameters.
+// ------------------------------------------------------------
+Table tlm_gnmic_cluster_config {
+  id                  INT      [pk, not null, note: "Always 0 — single-row singleton."]
+  cluster_name        VARCHAR  [not null, default: "tms-gnmic-cluster", note: "Cluster identifier used in Consul leader key and target lock keys."]
+  targets_watch_timer INT      [not null, default: 30, note: "Seconds between cluster leader checks for target redistribution."]
+  connection_timeout  VARCHAR  [not null, default: "10s", note: "gNMI dial timeout per router."]
+  retry_timer         VARCHAR  [not null, default: "10s", note: "Wait between connection retries."]
+  max_retry           INT      [not null, default: 3,    note: "Maximum retry attempts before marking router disconnected."]
+  keepalive_time      VARCHAR  [not null, default: "60s", note: "gRPC keepalive interval. Must be > connection_timeout."]
+  gnmi_port           INT      [not null, default: 57400, note: "Default gNMI port applied to all routers unless overridden per-router."]
+  use_tls             TINYINT  [not null, default: 0,  note: "0=TLS off (lab default), 1=TLS on. Applies to all Dial-In connections."]
+  skip_verify         TINYINT  [not null, default: 1,  note: "Skip TLS certificate verification. Should be 0 in production."]
+  client_tls          TINYINT  [not null, default: 0,  note: "Enable mutual TLS (mTLS). Requires cert/key paths in tlm_credentials."]
+  updated_at          DATETIME [not null]
+
+  note: "Global gNMIc cluster configuration. Single row (id=0). ST-03, ST-04 settings. Changing cluster_name requires restarting all gNMIc instances. keepalive_time > connection_timeout enforced at API layer."
+}
+
+// ------------------------------------------------------------
+// tlm_gnmic_instances
+// One row per gNMIc instance (3 total).
+// In cluster mode, the cluster itself handles target distribution.
+// This table tracks instance metadata and API endpoints for TMS monitoring.
+// ------------------------------------------------------------
+Table tlm_gnmic_instances {
+  id            INT          [pk, increment]
+  name          VARCHAR      [not null, unique, note: "e.g. gnmic-01, gnmic-02, gnmic-03."]
+  api_host      VARCHAR      [not null, note: "Host/IP where this instance's REST API listens."]
+  api_port      INT          [not null, default: 7890, note: "gNMIc cluster REST API port. Used by TMS to query /api/v1/cluster."]
+  status        ENUM         [not null, default: "Running", note: "Running | Stopped | Error — reflects last known state from API health check."]
+  is_leader     TINYINT      [not null, default: 0, note: "1 if this instance is the current cluster leader. Updated by TMS polling /api/v1/cluster/leader."]
+  locked_targets INT         [not null, default: 0, note: "Number of router targets currently locked to this instance. Updated by TMS polling."]
+  debug_mode    TINYINT      [not null, default: 0, note: "1 = verbose logging active on this instance."]
+  last_seen_at  DATETIME     [note: "Last time TMS successfully polled this instance's API. NULL if never polled."]
+  updated_at    DATETIME     [not null]
+
+  note: "Registry of gNMIc cluster member instances. Targets are distributed automatically by the cluster leader (not assigned manually). TMS reads this table to build the Cluster Agent monitoring screen (AA-01). is_leader and locked_targets are refreshed by polling /api/v1/cluster."
+}
+
+// ------------------------------------------------------------
+// tlm_consul_config  (singleton, id=0)
+// Consul distributed locker configuration for gNMIc cluster.
+// ------------------------------------------------------------
+Table tlm_consul_config {
+  id            INT      [pk, not null, note: "Always 0 — single-row singleton."]
+  consul_host   VARCHAR  [not null, note: "Consul agent address (host:port). e.g. consul-agent:8500."]
+  token_enc     VARCHAR  [note: "AES-256 encrypted Consul ACL token. NULL if Consul runs without ACL."]
+  enabled       TINYINT  [not null, default: 1, note: "1 = Consul locker active (required for cluster mode). 0 = disabled (single-instance fallback only)."]
+  updated_at    DATETIME [not null]
+
+  note: "Consul distributed locker config. Required for gNMIc cluster mode. Without Consul, the cluster cannot elect a leader or distribute targets. Single row (id=0). ST-04 settings."
+}
+
+
+// ============================================================
+// DOMAIN 2: ROUTERS
+// ============================================================
+
+Table tlm_routers {
+  id              INT      [pk, increment]
+  cat_device_id   INT      [not null, unique, note: "Cross-database reference → cat_device.id (external network catalog, same MariaDB server). Source of truth for hostname, IP, vendor. No DB-level FK — enforced at app layer."]
+  short_name      VARCHAR  [not null, unique, note: "Short identifier (e.g. HAN-PE-01). Cached from cat_device."]
+  vendor          ENUM     [not null, note: "Cisco | Juniper | Nokia."]
+  model           VARCHAR  [note: "Retrieved via NETCONF on add/refresh."]
+  os_version      VARCHAR  [note: "Retrieved via NETCONF on add/refresh."]
+  ip_address      VARCHAR  [not null, unique, note: "Cached from cat_device.ip_address. UNIQUE — one TMS entry per IP."]
+  gnmi_port       INT      [note: "Per-router gNMI port override. NULL = use tlm_gnmic_cluster_config.gnmi_port."]
+  status          ENUM     [not null, default: "Active", note: "Active | Warning | Offline."]
+  created_at      DATETIME [not null]
+  updated_at      DATETIME [not null]
+
+  note: "Central router registry. gNMI Dial-In only (oper_mode and agent_instance_id columns removed). Target distribution to gNMIc instances is managed automatically by the cluster. cat_device_id is a cross-database reference enforced at app layer. gnmi_port overrides the cluster-level default when a router uses a non-standard port."
+}
+
+
+// ============================================================
+// DOMAIN 3: PROFILES & ASSOCIATIONS (gNMI Dial-In only)
+// ============================================================
+
+Table tlm_profiles {
+  id           INT      [pk, increment]
+  name         VARCHAR  [not null, unique]
+  vendor       ENUM     [not null, note: "Cisco | Juniper | Nokia | All."]
+  description  TEXT
+  created_at   DATETIME [not null]
+  updated_at   DATETIME [not null]
+
+  note: "Named collection of gNMI sensor subscriptions. Used for Dial-In routers only. Applies to all routers linked via tlm_profile_associations."
+}
+
+Table tlm_yang_paths {
+  id             INT      [pk, increment]
+  yang_node_id   INT      [note: "FK → tlm_yang_nodes. NULL for manually defined paths not from an uploaded YANG model."]
+  bundle_id      INT      [note: "FK → tlm_yang_version_bundles. NULL = version-agnostic."]
+  path           VARCHAR  [not null, note: "Full gNMI XPath."]
+  vendor_scope   ENUM     [not null, note: "Cisco | Juniper | Nokia | All."]
+  description    TEXT
+  created_at     DATETIME [not null]
+  updated_at     DATETIME [not null]
+
+  indexes {
+    (path, bundle_id) [unique, name: "uq_path_bundle"]
+  }
+
+  note: "Curated library of sensor paths. bundle_id = NULL means version-agnostic. Non-NULL bundle_id scopes path to a specific YANG version bundle."
+}
+
+Ref: tlm_yang_paths.yang_node_id > tlm_yang_nodes.id           [delete: set null]
+Ref: tlm_yang_paths.bundle_id    > tlm_yang_version_bundles.id [delete: set null]
+
+Table tlm_profile_sensors {
+  id                 INT      [pk, increment]
+  profile_id         INT      [not null]
+  yang_path_id       INT      [not null, note: "FK → tlm_yang_paths. RESTRICT — prevents deleting a path in active use."]
+  interval_sec       INT      [not null, default: 60, note: "Minimum 10 seconds (gNMI SAMPLE mode floor). Used in cluster config YAML."]
+  subscription_mode  ENUM     [not null, default: "SAMPLE", note: "SAMPLE | ON_CHANGE | TARGET_DEFINED."]
+
+  indexes {
+    (profile_id, yang_path_id) [unique, name: "uq_profile_yang_path"]
+  }
+
+  note: "Links a profile to a yang_path with collection interval and gNMI subscription mode. interval_sec minimum is 10s (gNMI constraint, stricter than old Telegraf 2s minimum)."
+}
+
+Ref: tlm_profile_sensors.profile_id   > tlm_profiles.id   [delete: cascade]
+Ref: tlm_profile_sensors.yang_path_id > tlm_yang_paths.id [delete: restrict]
+
+Table tlm_profile_associations {
+  id               INT      [pk, increment]
+  router_id        INT      [not null]
+  profile_id       INT      [not null]
+  cluster_status   ENUM     [not null, default: "Pending", note: "Pending | Applied. Pending = cluster config updated but cluster leader has not yet confirmed subscription delivery. Drives 'Pending Cluster Apply' badge in UI (PA-03)."]
+  associated_at    DATETIME [not null]
+  last_applied_at  DATETIME [note: "NULL until cluster confirms first successful subscription delivery."]
+
+  indexes {
+    (router_id, profile_id) [unique, name: "uq_router_profile"]
+  }
+
+  note: "Join table between tlm_routers and tlm_profiles. Only Dial-In routers appear here. agent_type removed (only gNMIc). cluster_status replaces push_status — tracks whether the cluster has applied the subscription (not per-instance push)."
+}
+
+Ref: tlm_profile_associations.router_id  > tlm_routers.id  [delete: cascade]
+Ref: tlm_profile_associations.profile_id > tlm_profiles.id [delete: cascade]
+
+
+// ============================================================
+// DOMAIN 4: FLINK RULE PIPELINE  (v4.1)
+// ============================================================
+// Architecture: 4 independent source tables → 4 compacted Kafka topics
+//   rules.path_rename   → Flink PathRename stage
+//   rules.field_rename  → Flink FieldRename stage
+//   rules.label_rename  → Flink LabelRename stage
+//   rules.filter        → Flink Filter stage (applied FIRST in pipeline)
+// Each table has a per-table revision counter for Flink stale-message detection.
+// Sync job mirrors each table to ClickHouse (tlm_*_mirror) for dashboard JOINs.
+// ============================================================
+
+// ------------------------------------------------------------
+// tlm_revision_counter
+// Monotonic per-table version counter. Incremented in the same
+// transaction as every INSERT / UPDATE / DELETE on the rule tables.
+// ------------------------------------------------------------
+Table tlm_revision_counter {
+  table_name   VARCHAR [pk, not null, note: "One of: tlm_path_aliases | tlm_metric_aliases | tlm_label_aliases | tlm_filter_rules."]
+  counter      BIGINT  [not null, default: 0, note: "Monotonic, never reset, never decremented. Flink uses this to discard stale Kafka messages."]
+  updated_at   DATETIME [not null]
+
+  note: "Per-table monotonic revision counter. App increments in same transaction as CRUD on the rule table. Flink reads revision from each rule event to detect and discard out-of-order messages. Seed rows: tlm_path_aliases=0, tlm_metric_aliases=0, tlm_label_aliases=0, tlm_filter_rules=0."
+}
+
+// ------------------------------------------------------------
+// tlm_path_aliases
+// Path alias (PathRename) rules. Maps raw sensor path → canonical alias path.
+// id=0 RESERVED: "no rule matched".
+// ------------------------------------------------------------
+Table tlm_path_aliases {
+  id            INT      [pk, increment, note: "= ClickHouse path_id in tlm_metrics. id=0 reserved for 'no rule matched'."]
+  vendor_code   VARCHAR  [not null, note: "Cisco | Juniper | Nokia | All."]
+  original_path VARCHAR  [not null, note: "Raw sensor path as received from router. Never deleted while ClickHouse data references this id."]
+  alias_path    VARCHAR  [not null, note: "Canonical alias path written into ClickHouse. Never modified after Active — create new + deprecate old if change needed."]
+  status        TINYINT  [not null, default: 1, note: "1=Active, 0=Deprecated (soft-delete)."]
+  revision      BIGINT   [not null, note: "From tlm_revision_counter[tlm_path_aliases]. Set by app in same CRUD transaction."]
+  pushed_at     DATETIME [note: "Set by sync job after successful INSERT into ClickHouse tlm_path_aliases_mirror. NULL = not yet synced."]
+  created_by    INT      [not null, note: "FK → tlm_users.id."]
+  created_at    DATETIME [not null]
+  updated_at    DATETIME [not null]
+
+  indexes {
+    (vendor_code, original_path) [unique, name: "uq_path_alias_source"]
+    (vendor_code, alias_path, status) [unique, name: "uq_path_alias_target_active"]
+    status  [name: "idx_status"]
+    revision [name: "idx_revision"]
+    pushed_at [name: "idx_pushed_at"]
+  }
+
+  note: "Path alias rules for Flink PathRename stage. Saving an alias auto-generates a Kafka event on rules.path_rename topic. Soft-delete (status=0) preserves id for ClickHouse integrity. MA-05 user story."
+}
+
+Ref: tlm_path_aliases.created_by > tlm_users.id
+
+// ------------------------------------------------------------
+// tlm_metric_aliases
+// Metric field alias (FieldRename) rules.
+// Maps (vendor, path scope, original metric name) → alias metric name + transform.
+// ------------------------------------------------------------
+Table tlm_metric_aliases {
+  id                   INT      [pk, increment]
+  vendor_code          VARCHAR  [not null, note: "Cisco | Juniper | Nokia | All."]
+  path_alias_id        INT      [note: "Logic-FK → tlm_path_aliases.id. NULL = any-path scope (applies to all paths). NOT NULL = path-scoped."]
+  original_name        VARCHAR  [not null, note: "Raw metric leaf name from router (match_metric in FieldRename event)."]
+  alias_metric         VARCHAR  [not null, note: "Canonical metric name written into ClickHouse.metric_name."]
+  value_type_override  TINYINT  [note: "NULL = keep raw type. 1=number, 2=string, 3=bool."]
+  source_unit          VARCHAR  [note: "Raw unit (UCUM). NULL for non-numeric."]
+  target_unit          VARCHAR  [note: "Normalized unit (UCUM). Copied to ClickHouse.unit."]
+  transform_kind       TINYINT  [not null, default: 0, note: "0=identity, 1=linear(scale×x+offset), 2=expression(Java var x), 3=enum_mapping(JSON)."]
+  scale_factor         DECIMAL  [not null, default: 1]
+  offset_value         DECIMAL  [not null, default: 0]
+  transform_expression VARCHAR  [note: "NOT NULL when transform_kind=2, NULL otherwise."]
+  enum_mapping         JSON     [note: "NOT NULL when transform_kind=3, NULL otherwise."]
+  priority             SMALLINT [not null, default: 100, note: "Higher wins when multiple rules match. Convention: path-scoped=100, any-path=50, vendor=All=10."]
+  status               TINYINT  [not null, default: 1, note: "1=Active, 0=Deprecated."]
+  revision             BIGINT   [not null]
+  pushed_at            DATETIME [note: "NULL = not yet synced to ClickHouse mirror."]
+  created_by           INT      [not null]
+  created_at           DATETIME [not null]
+  updated_at           DATETIME [not null]
+
+  indexes {
+    (vendor_code, path_alias_id, original_name) [unique, name: "uq_metric_alias_source"]
+    (vendor_code, path_alias_id, alias_metric)  [unique, name: "uq_metric_alias_target"]
+    path_alias_id [name: "idx_path_alias_id"]
+    status    [name: "idx_status"]
+    revision  [name: "idx_revision"]
+    pushed_at [name: "idx_pushed_at"]
+  }
+
+  note: "Metric field rename + value transform rules for Flink FieldRename stage. Supports linear transform, expression, and enum mapping. MA-01 user story."
+}
+
+Ref: tlm_metric_aliases.created_by    > tlm_users.id
+Ref: tlm_metric_aliases.path_alias_id > tlm_path_aliases.id [delete: set null]
+
+// ------------------------------------------------------------
+// tlm_label_aliases
+// Label key rename + value normalize rules for Flink LabelRename stage.
+// Solves multi-vendor tag key heterogeneity:
+//   Cisco "interface_name" | Juniper "interface" | Nokia "if-name" → "if_name"
+// ------------------------------------------------------------
+Table tlm_label_aliases {
+  id            INT      [pk, increment]
+  vendor_code   VARCHAR  [not null, note: "Cisco | Juniper | Nokia | All."]
+  path_alias_id INT      [note: "Logic-FK → tlm_path_aliases.id. NULL = any-path. NOT NULL = path-scoped."]
+  original_key  VARCHAR  [not null, note: "Raw tag key from router."]
+  alias_key     VARCHAR  [not null, note: "Canonical tag key written into ClickHouse.labels map."]
+  lv_kind       TINYINT  [not null, default: 0, note: "0=identity (key rename only), 1=regex(lv_pattern+lv_replace), 2=enum_mapping(lv_mapping)."]
+  lv_pattern    VARCHAR  [note: "NOT NULL when lv_kind=1 (regex pattern for value transform)."]
+  lv_replace    VARCHAR  [note: "NOT NULL when lv_kind=1 (regex replacement string)."]
+  lv_mapping    JSON     [note: "NOT NULL when lv_kind=2 (key→value enum mapping for value normalization)."]
+  priority      SMALLINT [not null, default: 100]
+  status        TINYINT  [not null, default: 1]
+  revision      BIGINT   [not null]
+  pushed_at     DATETIME [note: "NULL = not yet synced to ClickHouse mirror."]
+  created_by    INT      [not null]
+  created_at    DATETIME [not null]
+  updated_at    DATETIME [not null]
+
+  indexes {
+    (vendor_code, path_alias_id, original_key) [unique, name: "uq_label_alias_source"]
+    (vendor_code, path_alias_id, alias_key)    [unique, name: "uq_label_alias_target"]
+    path_alias_id [name: "idx_path_alias_id"]
+    status    [name: "idx_status"]
+    revision  [name: "idx_revision"]
+    pushed_at [name: "idx_pushed_at"]
+  }
+
+  note: "Label key rename + value normalize rules for Flink LabelRename stage. FR-01/FR-02 user stories. Two-layer: (1) mandatory key rename; (2) optional value normalization (regex or enum mapping). Applied after PathRename and FieldRename."
+}
+
+Ref: tlm_label_aliases.created_by    > tlm_users.id
+Ref: tlm_label_aliases.path_alias_id > tlm_path_aliases.id [delete: set null]
+
+// ------------------------------------------------------------
+// tlm_filter_rules
+// Drop / keep metric records. Applied FIRST in Flink pipeline (before rename stages).
+// ------------------------------------------------------------
+Table tlm_filter_rules {
+  id                 INT      [pk, increment]
+  vendor_code        VARCHAR  [not null, note: "Cisco | Juniper | Nokia | All."]
+  match_path         VARCHAR  [not null, default: "", note: "Path scope after PathRename. Empty string = apply to all paths."]
+  match_metric       VARCHAR  [note: "Metric name filter. NULL = filter by path only (all metrics in that path)."]
+  filter_expression  VARCHAR  [not null, default: "", note: "Predicate expression. Empty = unconditional (always TRUE). Syntax defined by Flink (e.g. 'value > 1000', 'tag.host LIKE %prod%')."]
+  filter_action      TINYINT  [not null, default: 0, note: "0=EXCLUDE_IF_MATCH (drop when predicate TRUE — noise filter). 1=INCLUDE_IF_MATCH (keep only when predicate TRUE — selective sample)."]
+  priority           SMALLINT [not null, default: 100, note: "Higher wins when multiple rules match same record."]
+  status             TINYINT  [not null, default: 1, note: "1=Active, 0=Inactive."]
+  revision           BIGINT   [not null]
+  pushed_at          DATETIME [note: "NULL = not yet synced to ClickHouse mirror."]
+  created_by         INT      [not null]
+  created_at         DATETIME [not null]
+  updated_at         DATETIME [not null]
+
+  indexes {
+    (vendor_code, match_path, match_metric) [name: "idx_filter_match"]
+    status    [name: "idx_status"]
+    revision  [name: "idx_revision"]
+    pushed_at [name: "idx_pushed_at"]
+  }
+
+  note: "Filter rules for Flink Filter stage. Applied FIRST in pipeline — before rename stages. Intentional drop (EXCLUDE_IF_MATCH) is distinct from alias miss fallthrough (which preserves records). FR-03/FR-04 user stories. FR-06 (Fallthrough Monitor) distinguishes filter-dropped from alias-miss records."
+}
+
+Ref: tlm_filter_rules.created_by > tlm_users.id
+
+
+// ============================================================
+// DOMAIN 5: RESOURCE UTILIZATION BINDING
+// ============================================================
+// Two-tier design:
+//   Tier 1 — tlm_util_binding: common metadata for all resource types.
+//   Tier 2 — per-resource config tables: type-specific details.
+// Plus: tlm_util_resource_config for N-consecutive bucket settings.
+// ============================================================
+
+// ------------------------------------------------------------
+// tlm_util_binding  (Tier 1 — common metadata)
+// Each row = one metric participating in a utilization group.
+// ------------------------------------------------------------
+Table tlm_util_binding {
+  id             INT      [pk, increment]
+  resource_type  VARCHAR  [not null, note: "interface | cpu | memory | queue | packet_error. Determines which Tier 2 config table to read."]
+  metric_alias   VARCHAR  [not null, note: "Matches tlm_metric_aliases.alias_metric. The metric name AFTER Flink Job #1 rename."]
+  direction      TINYINT  [note: "NULL = not applicable (CPU). 0=ingress/in/used. 1=egress/out/free. 2=total/capacity (denominator)."]
+  util_group     VARCHAR  [not null, note: "Group name linking related metrics (e.g. 'interface_traffic' groups if_in_octets + if_out_octets). Service computes 1 utilization record per group per cycle."]
+  vendor_code    VARCHAR  [not null, note: "Cisco | Juniper | Nokia | All. Same group can have different bindings per vendor."]
+  status         TINYINT  [not null, default: 1, note: "1=Active, 0=Inactive (soft-disable, preserves config)."]
+  created_by     INT      [not null]
+  created_at     DATETIME [not null]
+  updated_at     DATETIME [not null]
+
+  indexes {
+    (resource_type, metric_alias, vendor_code) [unique, name: "uq_util_binding"]
+  }
+
+  note: "Central binding table. Each row declares 'metric X plays role Direction in utilization group G for vendor V'. Resource Utilization Service loads all active bindings on startup and refreshes every 60s. UB-01 through UB-08 user stories."
+}
+
+Ref: tlm_util_binding.created_by > tlm_users.id
+
+// ------------------------------------------------------------
+// tlm_util_if_config  (Tier 2a — Interface Traffic)
+// ------------------------------------------------------------
+Table tlm_util_if_config {
+  id                INT     [pk, increment]
+  binding_id        INT     [not null, note: "Logic-FK → tlm_util_binding.id."]
+  label_key_if_name VARCHAR [not null, note: "Label key in metric that contains the interface name. After Label Alias (Flink Job #1) usually 'if_name', but operator confirms or overrides."]
+  speed_unit        TINYINT [not null, default: 0, note: "Unit of cat_interface.SPEED (INPUT from catalog): 0=bps (default), 1=Mbps, 2=Gbps. Service always outputs Mbps to ClickHouse regardless of this unit."]
+  status            TINYINT [not null, default: 1]
+  created_by        INT     [not null]
+  created_at        DATETIME [not null]
+  updated_at        DATETIME [not null]
+
+  note: "Interface Traffic binding details (Tier 2a). One row per tlm_util_binding row with resource_type='interface'. cat_interface lookup: JOIN (device_id, labels[label_key_if_name]) → SPEED. UB-02."
+}
+
+Ref: tlm_util_if_config.binding_id  > tlm_util_binding.id [delete: cascade]
+Ref: tlm_util_if_config.created_by  > tlm_users.id
+
+// ------------------------------------------------------------
+// tlm_util_cpu_config  (Tier 2b — CPU)
+// ------------------------------------------------------------
+Table tlm_util_cpu_config {
+  id               INT     [pk, increment]
+  binding_id       INT     [not null, note: "Logic-FK → tlm_util_binding.id."]
+  label_key_cpu_id VARCHAR [note: "Label key containing CPU index. NULL if metric is a single total value for the whole router."]
+  status           TINYINT [not null, default: 1]
+  created_by       INT     [not null]
+  created_at       DATETIME [not null]
+  updated_at       DATETIME [not null]
+
+  note: "CPU binding details (Tier 2b). Capacity is always hardcoded to 100% — no capacity_kind needed. UI does not expose capacity configuration for CPU. UB-03."
+}
+
+Ref: tlm_util_cpu_config.binding_id > tlm_util_binding.id [delete: cascade]
+Ref: tlm_util_cpu_config.created_by > tlm_users.id
+
+// ------------------------------------------------------------
+// tlm_util_mem_config  (Tier 2c — Memory)
+// ------------------------------------------------------------
+Table tlm_util_mem_config {
+  id                    INT     [pk, increment]
+  binding_id            INT     [not null, note: "Logic-FK → tlm_util_binding.id."]
+  label_key_pool        VARCHAR [note: "Label key containing memory pool name. NULL if device reports total memory only."]
+  capacity_kind         TINYINT [not null, default: 1, note: "0=percent_gauge (metric already %, treated like CPU). 1=metric_total (used/total bytes, requires direction=total binding in same group). 2=hardcode_bytes (enter fixed capacity_bytes)."]
+  capacity_metric_alias VARCHAR [note: "NOT NULL when capacity_kind=1 — alias of the total-bytes metric. Must have direction=total in same util_group."]
+  capacity_bytes        BIGINT  [note: "NOT NULL when capacity_kind=2 — fixed total bytes when catalog unavailable."]
+  status                TINYINT [not null, default: 1]
+  created_by            INT     [not null]
+  created_at            DATETIME [not null]
+  updated_at            DATETIME [not null]
+
+  note: "Memory binding details (Tier 2c). Three capacity modes: (A) metric emits used+total bytes (capacity_kind=1 — legacy routers); (B) metric emits % directly (capacity_kind=0 — treated like CPU); (C) hardcoded bytes (capacity_kind=2). UB-04."
+}
+
+Ref: tlm_util_mem_config.binding_id > tlm_util_binding.id [delete: cascade]
+Ref: tlm_util_mem_config.created_by > tlm_users.id
+
+// ------------------------------------------------------------
+// tlm_util_queue_config  (Tier 2d — Queue Drop Rate)
+// ------------------------------------------------------------
+Table tlm_util_queue_config {
+  id                  INT     [pk, increment]
+  binding_id          INT     [not null, note: "Logic-FK → tlm_util_binding.id."]
+  label_key_if_name   VARCHAR [not null, note: "Label key containing the interface name hosting the queue."]
+  label_key_queue_id  VARCHAR [not null, note: "Label key containing the queue name/ID."]
+  capacity_metric_alias VARCHAR [not null, note: "Alias of the total-packets metric (direction=total). Used as denominator for drop_pct."]
+  status              TINYINT [not null, default: 1]
+  created_by          INT     [not null]
+  created_at          DATETIME [not null]
+  updated_at          DATETIME [not null]
+
+  note: "Queue Drop Rate binding details (Tier 2d). Both Drop and Total direction bindings required in the same util_group. UB-05."
+}
+
+Ref: tlm_util_queue_config.binding_id > tlm_util_binding.id [delete: cascade]
+Ref: tlm_util_queue_config.created_by > tlm_users.id
+
+// ------------------------------------------------------------
+// tlm_util_packet_error_config  (Tier 2e — Packet Error Rate)
+// Supports ANY OpenConfig interface counter under
+//   /interfaces/interface/state/counters/*
+// Tall format output: 1 row per metric per interface.
+// ------------------------------------------------------------
+Table tlm_util_packet_error_config {
+  id                INT     [pk, increment]
+  binding_id        INT     [not null, note: "Logic-FK → tlm_util_binding.id."]
+  label_key_if_name VARCHAR [not null, note: "Label key containing the interface name."]
+  error_kind        TINYINT [not null, default: 0, note: "0=counter (cumulative — compute delta → eps). 1=gauge_rate (already in packets/sec — use directly)."]
+  status            TINYINT [not null, default: 1]
+  created_by        INT     [not null]
+  created_at        DATETIME [not null]
+  updated_at        DATETIME [not null]
+
+  note: "Packet Error Rate binding details (Tier 2e). Only OpenConfig interface counters allowed (path under /interfaces/interface/state/counters/). At least one binding per util_group required (no mandatory ingress/egress pair). Output unit: eps (errors/sec). UB-06."
+}
+
+Ref: tlm_util_packet_error_config.binding_id > tlm_util_binding.id [delete: cascade]
+Ref: tlm_util_packet_error_config.created_by > tlm_users.id
+
+// ------------------------------------------------------------
+// tlm_util_resource_config
+// N consecutive buckets configuration per resource type.
+// Seeded at deploy time (5 fixed rows). Operator adjusts via UI (UB-10).
+// Read by Alert Engine via Resource Utilization Service API.
+// ------------------------------------------------------------
+Table tlm_util_resource_config {
+  id                    INT     [pk, increment]
+  resource_type         VARCHAR [not null, unique, note: "One of: interface | cpu | memory | queue | packet_error. Seeded at deploy, no new rows."]
+  n_consecutive_buckets TINYINT [not null, default: 1, note: "Number of consecutive 5-min buckets that must breach the condition before Alert Engine fires. Range: 1–12 (max 60 min). Alert CLEARS when N consecutive buckets do NOT breach. Default=1 = fire immediately on first breach (backward-compatible)."]
+  updated_by            INT     [not null, note: "FK → tlm_users.id. 0 = system (deploy-time seed)."]
+  updated_at            DATETIME [not null]
+
+  note: "N-consecutive bucket setting per resource type. Controls Alert Engine sensitivity. Interface=3 (15 min), CPU=5 (25 min), Memory=5 (25 min), Queue=2 (10 min), PacketError=2 (10 min) are suggested production values. Alert Engine reads N via Resource Utilization Service API (GET /api/v1/resource-config/n-consecutive). UB-10."
+}
+
+Ref: tlm_util_resource_config.updated_by > tlm_users.id
+
+
+// ============================================================
+// DOMAIN 6: ALERT ENGINE  (v5.0)
+// ============================================================
+// Rule model: Basic (1 condition: Type A/B/C) + Composite (2-10 conditions, AND/OR).
+// All conditions in a composite rule must share the same resource_type
+// and are evaluated on the same dimension instance (e.g. same if_name).
+// N-consecutive bucket logic: FIRE when N consecutive 5-min buckets all breach.
+// CLEAR when N consecutive 5-min buckets all do NOT breach.
+// Deduplication: Redis TTL per (rule_id, dimension_key). Per-rule window.
+// ============================================================
+
+// ------------------------------------------------------------
+// tlm_alert_rule  — Rule header
+// ------------------------------------------------------------
+Table tlm_alert_rule {
+  id                   INT      [pk, increment]
+  name                 VARCHAR  [not null, unique, note: "Display name. Unique among active rules."]
+  description          VARCHAR  [note: "Business description. Nullable."]
+  severity             TINYINT  [not null, default: 2, note: "0=Info, 1=Warning, 2=Major, 3=Critical, 4=Error. Copied verbatim to fired alert."]
+  resource_type        VARCHAR  [not null, note: "interface | cpu | memory | queue | packet_error. ALL conditions must share this type."]
+  combinator           TINYINT  [not null, default: 1, note: "1=AND (all conditions must breach). 2=OR (any condition must breach). Ignored for basic rules (1 condition)."]
+  dedup_window_seconds INT      [not null, default: 3600, note: "Default 60 min. Same (rule, dimension) fires at most once per window."]
+  dedup_dimension      VARCHAR  [not null, default: "device_interface", note: "Dedup key granularity: device | device_interface | device_cpu | device_pool | device_queue | custom."]
+  status               TINYINT  [not null, default: 1, note: "1=Active (engine evaluates). 0=Disabled (skip, not deleted)."]
+  created_by           INT      [not null]
+  created_at           DATETIME [not null]
+  updated_by           INT      [not null]
+  updated_at           DATETIME [not null]
+
+  indexes {
+    (name, status) [unique, name: "uq_alert_rule_name_active"]
+    status        [name: "idx_status"]
+    resource_type [name: "idx_resource_type"]
+  }
+
+  note: "Alert rule header. Basic rule = 1 condition row in tlm_alert_rule_condition. Composite rule = 2–10 condition rows with same resource_type. Alert Engine reloads rules every ~150s (5 evaluation cycles). AL-01 through AL-07."
+}
+
+Ref: tlm_alert_rule.created_by > tlm_users.id
+Ref: tlm_alert_rule.updated_by > tlm_users.id
+
+// ------------------------------------------------------------
+// tlm_alert_rule_condition  — Flat condition rows (LEAF only, no tree)
+// Each row = one condition of a rule. Rule has 1..10 rows.
+// ------------------------------------------------------------
+Table tlm_alert_rule_condition {
+  id                   INT      [pk, increment]
+  rule_id              INT      [not null, note: "Logic-FK → tlm_alert_rule.id. All conditions of one rule share this."]
+  resource_type        VARCHAR  [not null, note: "Must match tlm_alert_rule.resource_type."]
+  field_name           VARCHAR  [not null, note: "Column name in the 5-min MV table. Valid values by resource_type: interface: util_in_pct, util_out_pct, util_max_pct, rate_in_mbps, rate_out_mbps; cpu: util_pct; memory: util_pct, used_bytes; queue: drop_pct; packet_error: value_eps."]
+  compare_type         TINYINT  [not null, note: "1=Threshold/TypeA (vs fixed value). 2=PointInTimePctChange/TypeB (vs same slot in history). 3=WindowAggregate/TypeC (vs AVG/MAX of a long window)."]
+  operator             VARCHAR  [not null, note: "> | >= | < | <= | = | !=."]
+  threshold_value      DECIMAL  [not null, note: "Type A: absolute threshold. Type B: % change threshold ∈ [-100, 1000]. Type C: multiplier ∈ [0.1, 10] (current > aggregate × multiplier)."]
+  history_offset_sec   INT      [note: "Type B only: historical offset in seconds. Whitelist: 3600 (1h), 86400 (1d), 259200 (3d), 604800 (7d)."]
+  agg_func             VARCHAR  [note: "Type C only: AVG | MAX | MIN."]
+  agg_window_sec       INT      [note: "Type C only: aggregation window. Whitelist: 3600 (1h), 86400 (24h), 604800 (7d)."]
+  created_at           DATETIME [not null]
+  updated_at           DATETIME [not null]
+
+  indexes {
+    rule_id [name: "idx_rule_id"]
+  }
+
+  note: "Flat condition rows for alert rules. No tree structure — all rows are leaf conditions. Validation enforces: same resource_type as rule header; max 10 conditions per rule; Type B history_offset_sec and Type C agg_window_sec from whitelists. AL-02/AL-03/AL-04/AL-05."
+}
+
+Ref: tlm_alert_rule_condition.rule_id > tlm_alert_rule.id [delete: cascade]
+
+// ------------------------------------------------------------
+// tlm_alert_rule_audit  — Rule lifecycle audit log (MariaDB)
+// Tracks CREATE / UPDATE / DISABLE / ENABLE / DELETE on rules.
+// Retention: 90 days (daily cleanup job).
+// ------------------------------------------------------------
+Table tlm_alert_rule_audit {
+  id              BIGINT   [pk, increment]
+  rule_id         INT      [not null, note: "Logic-FK → tlm_alert_rule.id. Preserved even after rule deletion."]
+  action          VARCHAR  [not null, note: "CREATE | UPDATE | DISABLE | ENABLE | DELETE."]
+  actor_user_id   INT      [not null, note: "FK → tlm_users.id."]
+  before_snapshot JSON     [note: "Snapshot of rule + condition list before action. NULL when action=CREATE."]
+  after_snapshot  JSON     [note: "Snapshot after action. NULL when action=DELETE."]
+  note            VARCHAR  [note: "Optional operator note (e.g. reason for disable)."]
+  created_at      DATETIME [not null]
+
+  indexes {
+    rule_id    [name: "idx_rule_id"]
+    created_at [name: "idx_created_at"]
+  }
+
+  note: "Immutable rule lifecycle audit. Written by service layer in same transaction as rule CRUD (ensures atomicity). Snapshots are JSON-serialized rule + flat condition list. Drives AL-11 (rule audit log view). 90-day retention via cleanup job."
+}
+
+Ref: tlm_alert_rule_audit.actor_user_id > tlm_users.id
+
+// ------------------------------------------------------------
+// tlm_notification_channels
+// Configured notification destinations (email, Slack, webhook).
+// Notification delivery is handled by NOC PRO; TMS stores config
+// and emits fired alerts to Kafka for NOC PRO to consume.
+// ------------------------------------------------------------
+Table tlm_notification_channels {
+  id            INT      [pk, increment]
+  channel_name  VARCHAR  [not null, unique]
+  channel_type  ENUM     [not null, note: "Email | Slack | Webhook."]
+  config_json   TEXT     [not null, note: "JSON: email addresses / Slack webhook URL / endpoint + headers."]
+  enabled       TINYINT  [not null, default: 1]
+  created_at    DATETIME [not null]
+
+  note: "Notification channel definitions. Tested via Test button (AL-13). Actual delivery is performed by NOC PRO after consuming Kafka fired_alerts events. TMS stores intent (which channels a rule should use) and passes it in the rule snapshot payload."
+}
+
+// ------------------------------------------------------------
+// tlm_alert_rule_channels
+// Many-to-many: which notification channels a rule targets.
+// ------------------------------------------------------------
+Table tlm_alert_rule_channels {
+  id          INT [pk, increment]
+  rule_id     INT [not null]
+  channel_id  INT [not null]
+
+  indexes {
+    (rule_id, channel_id) [unique, name: "uq_rule_channel"]
+  }
+
+  note: "Join table: alert rule → notification channels. AL-13."
+}
+
+Ref: tlm_alert_rule_channels.rule_id    > tlm_alert_rule.id           [delete: cascade]
+Ref: tlm_alert_rule_channels.channel_id > tlm_notification_channels.id [delete: cascade]
+
+// ------------------------------------------------------------
+// tlm_active_alerts
+// Live alert tracker for acknowledged state only.
+// Alert Engine does NOT write here — this is for NOC operator ACK tracking.
+// The authoritative alert state lives in Redis (dedup) + ClickHouse tlm_alert_history.
+// ------------------------------------------------------------
+Table tlm_active_alerts {
+  id               INT      [pk, increment]
+  rule_id          INT      [not null, note: "Logic-FK → tlm_alert_rule.id."]
+  rule_name        VARCHAR  [not null, note: "Snapshot at fire time."]
+  device_id        INT      [not null, note: "Logic-FK → cat_device.device_id (external catalog)."]
+  device_name      VARCHAR  [not null, note: "Snapshot at fire time."]
+  resource_type    VARCHAR  [not null]
+  dimension_key    VARCHAR  [not null, note: "Same format as tlm_alert_history.dimension_key."]
+  severity         TINYINT  [not null]
+  triggered_value  FLOAT    [not null]
+  threshold_value  FLOAT    [not null]
+  first_fired_at   DATETIME [not null, note: "Timestamp of first FIRED event in current incident."]
+  last_fired_at    DATETIME [not null, note: "Updated each time Alert Engine fires the same (rule, dimension) again."]
+  status           ENUM     [not null, note: "Active | Acknowledged. Alert Engine sets Active on first FIRED emit to Kafka. NOC operator moves to Acknowledged (AL-09). Row is removed when Alert Engine emits CLEARED."]
+  acked_by         INT      [note: "FK → tlm_users.id. NULL until acknowledged."]
+  acked_at         DATETIME [note: "NULL until acknowledged."]
+
+  indexes {
+    (rule_id, dimension_key) [unique, name: "uq_active_alert_rule_dim"]
+    status [name: "idx_status"]
+    last_fired_at [name: "idx_last_fired_at"]
+  }
+
+  note: "Live alert instances visible on the Active Alerts screen (AL-08). Populated when Alert Engine emits FIRED to Kafka and TMS backend processes the event. Removed on CLEARED event. Acknowledgement (AL-09) sets status=Acknowledged. The authoritative alert history lives in ClickHouse tlm_alert_history."
+}
+
+Ref: tlm_active_alerts.rule_id  > tlm_alert_rule.id [delete: restrict]
+Ref: tlm_active_alerts.acked_by > tlm_users.id       [delete: set null]
+
+
+// ============================================================
+// DOMAIN 7: USERS & AUDIT
+// ============================================================
+
+Table tlm_users {
+  id            INT      [pk, increment]
+  username      VARCHAR  [not null, unique]
+  email         VARCHAR  [not null, unique]
+  pwd_hash      VARCHAR  [not null, note: "bcrypt hash — never store plaintext."]
+  role          ENUM     [not null, note: "Admin | Operator | Viewer."]
+  is_active     TINYINT  [not null, default: 1]
+  created_at    DATETIME [not null]
+  last_login_at DATETIME [note: "NULL until first login."]
+
+  note: "Application users. Deactivated (is_active=0) users cannot log in but records are preserved for audit history integrity."
+}
+
+Table tlm_audit_log {
+  id             INT      [pk, increment]
+  user_id        INT      [note: "FK → tlm_users. NULL for system-initiated actions."]
+  action_type    ENUM     [not null, note: "Config_Change | Login | Logout | Profile_Update | Alert_Acked | DB_Clear | User_Created | User_Deactivated | Path_Alias_Created | Path_Alias_Updated | Path_Alias_Deleted | Yang_Bundle_Uploaded | Yang_Bundle_Deleted | Util_Binding_Changed | Alert_Rule_Changed | Cluster_Rebalance_Triggered | Instance_Drained."]
+  entity_type    VARCHAR  [not null, note: "e.g. router | profile | tlm_path_aliases | alert_rule | tlm_util_binding | gnmic_instance | user | yang_version_bundle."]
+  entity_id      INT      [note: "PK of affected entity. NULL for non-entity actions (e.g. Login, Cluster_Rebalance_Triggered)."]
+  change_summary TEXT     [not null]
+  ip_address     VARCHAR  [note: "Client IP at time of action."]
+  created_at     DATETIME [not null]
+
+  note: "Immutable append-only audit log. No UPDATE or DELETE should ever run on this table. AU-01 through AU-03. Covers all operator actions including cluster operations (Cluster_Rebalance_Triggered, Instance_Drained) and new domains (Util_Binding_Changed, Alert_Rule_Changed)."
+}
+
+Ref: tlm_audit_log.user_id > tlm_users.id [delete: set null]
+
+
+// ============================================================
+// DOMAIN 8: SETTINGS — Singleton config tables (id=0 upsert)
+// ============================================================
+
+// ------------------------------------------------------------
+// tlm_credentials  (singleton, id=0)
+// gNMI Dial-In only. Dial-Out credentials removed.
+// ------------------------------------------------------------
+Table tlm_credentials {
+  id                   INT     [pk, note: "Always 0 — single-row singleton."]
+  netconf_user         VARCHAR [not null, note: "NETCONF username for device info refresh (model, OS version). Not used for telemetry collection."]
+  netconf_pwd_enc      VARCHAR [not null, note: "AES-256 encrypted NETCONF password."]
+  netconf_port         INT     [not null, default: 830]
+  gnmi_dialin_user     VARCHAR [not null, note: "gNMI username for all Dial-In routers."]
+  gnmi_dialin_pwd_enc  VARCHAR [not null, note: "AES-256 encrypted gNMI password."]
+  gnmi_cert_path       VARCHAR [note: "Path to TLS client certificate (mTLS). NULL when client_tls=0 in tlm_gnmic_cluster_config."]
+  gnmi_key_path        VARCHAR [note: "Path to TLS private key (mTLS)."]
+  gnmi_ca_path         VARCHAR [note: "Path to CA certificate for router TLS verification. NULL when skip_verify=1."]
+  password_ver         INT     [not null, default: 1, note: "Encryption key version — supports key rotation."]
+  updated_at           DATETIME [not null]
+
+  note: "Global credentials. Single row (id=0). Dial-Out credentials removed (no Dial-Out mode). TLS settings (use_tls, skip_verify, client_tls) moved to tlm_gnmic_cluster_config. ST-01/ST-02."
+}
+
+// ------------------------------------------------------------
+// tlm_kafka_config  (singleton, id=0)
+// Output config for gNMIc → Kafka.
+// ------------------------------------------------------------
+Table tlm_kafka_config {
+  id               INT     [pk, note: "Always 0 — single-row singleton."]
+  enabled          TINYINT [not null, default: 0]
+  brokers          TEXT    [not null, note: "Comma-separated: host:port,host:port."]
+  topic            VARCHAR [not null, default: "tlm_telemetry_raw", note: "Kafka topic for raw gNMIc output. Consumed by Flink Job #1."]
+  encoding_format  ENUM    [not null, default: "json", note: "json | proto. gNMIc supports both encodings for Kafka output."]
+  kafka_version    VARCHAR [not null, default: "2.7.0"]
+  compression_codec INT    [not null, default: 0, note: "0=None 1=GZIP 2=Snappy 3=LZ4 4=ZSTD."]
+  max_message_size INT     [not null, default: 1000000, note: "In bytes."]
+  updated_at       DATETIME [not null]
+
+  note: "Kafka output configuration for gNMIc cluster. Single row (id=0). Applied to ALL gNMIc instances via cluster config YAML. ST-05. Note: encoding_format now supports 'proto' in addition to 'json' (gNMIc native proto encoding — Flink handles both)."
+}
+
+// ------------------------------------------------------------
+// tlm_clickhouse_config  (singleton, id=0)
+// ------------------------------------------------------------
+Table tlm_clickhouse_config {
+  id               INT     [pk, note: "Always 0 — single-row singleton."]
+  hosts            TEXT    [not null, note: "Comma-separated ClickHouse host list."]
+  port             INT     [not null, default: 9000]
+  database         VARCHAR [not null, default: "ipms"]
+  ch_user          VARCHAR [not null]
+  ch_pwd_enc       VARCHAR [not null, note: "AES-256 encrypted."]
+  conn_pool_size   INT     [not null, default: 10]
+  retention_days   INT     [not null, default: 90, note: "TTL applied to tlm_metrics and utilization tables. Configured value only — actual TTL is set in ClickHouse DDL."]
+  updated_at       DATETIME [not null]
+
+  note: "ClickHouse connection config. Single row (id=0). retention_days drives the TTL on ClickHouse tables. ST-06/ST-07/ST-13."
+}
+
+// ------------------------------------------------------------
+// tlm_grafana_config  (singleton, id=0)
+// ------------------------------------------------------------
+Table tlm_grafana_config {
+  id             INT     [pk, note: "Always 0 — single-row singleton."]
+  base_url       VARCHAR [note: "e.g. https://grafana.example.com. NULL if not configured."]
+  api_token_enc  VARCHAR [note: "AES-256 encrypted API token. NULL if not configured."]
+  enabled        TINYINT [not null, default: 0]
+  updated_at     DATETIME [not null]
+
+  note: "Grafana integration base config. Single row (id=0). When enabled, 'Open in Grafana' buttons appear throughout TMS. Dashboard ID mappings per resource type stored in tlm_grafana_dashboard_map. GR-01."
+}
+
+// ------------------------------------------------------------
+// tlm_grafana_dashboard_map
+// Per-resource Grafana dashboard ID mapping for deep-links.
+// ------------------------------------------------------------
+Table tlm_grafana_dashboard_map {
+  id             INT     [pk, increment]
+  resource_key   VARCHAR [not null, unique, note: "One of: interface | cpu | memory | queue | packet_error | alert_history | pipeline_health. Extensible via INSERT."]
+  dashboard_id   VARCHAR [note: "Grafana dashboard UID or full URL. NULL = use default (community dashboard)."]
+  dashboard_name VARCHAR [note: "Human-readable label for UI display."]
+  enabled        TINYINT [not null, default: 1, note: "1 = deep-link button shown for this resource. 0 = hidden."]
+  updated_at     DATETIME [not null]
+
+  note: "Per-resource-type Grafana dashboard mapping. Drives deep-link URL generation: from Utilization Overview (GR-03), from Alert History (GR-04). Seeded with defaults at deploy. GR-05."
+}
+
+// ------------------------------------------------------------
+// tlm_service_config  (singleton, id=0)
+// Runtime parameters for Resource Utilization Service and Alert Engine.
+// ------------------------------------------------------------
+Table tlm_service_config {
+  id                    INT     [pk, note: "Always 0 — single-row singleton."]
+  util_poll_interval_sec INT    [not null, default: 300, note: "T_poll: Resource Utilization Service cycle interval. Min=60 (= gNMI sample rate). Changing requires service restart. ST-09."]
+  alert_cycle_sec       INT     [not null, default: 30,  note: "T_cycle: Alert Engine evaluation cycle. Optimal: T_poll/2. UI shows warning if outside optimal range. ST-10."]
+  alert_dedup_default_min INT   [not null, default: 60,  note: "Default dedup window (minutes) pre-filled when creating a new alert rule. ST-12."]
+  raw_metrics_ttl_days  INT     [not null, default: 7,   note: "TTL for tlm_metrics_raw ClickHouse table. Applied via ALTER TABLE."]
+  utilization_ttl_days  INT     [not null, default: 90,  note: "TTL for all tlm_*_utilization ClickHouse tables."]
+  alert_history_ttl_days INT    [not null, default: 90,  note: "TTL for tlm_alert_history ClickHouse table."]
+  updated_at            DATETIME [not null]
+
+  note: "Runtime service configuration. Single row (id=0). ST-09 through ST-13. Changing TTL values triggers ClickHouse ALTER TABLE statements. Changing util_poll_interval_sec or alert_cycle_sec requires service restart (or dynamic reconfiguration via service API if implemented)."
+}
+
+
+// ============================================================
+// DOMAIN 9: YANG MODEL LIBRARY
+// ============================================================
+
+Table tlm_yang_version_bundles {
+  id            INT      [pk, increment]
+  vendor        ENUM     [not null, note: "Cisco | Juniper | Nokia | OpenConfig."]
+  platform      VARCHAR  [note: "e.g. ASR9000, MX Series, 7750 SR. NULL for OpenConfig."]
+  os_version    VARCHAR  [note: "e.g. IOS-XR 7.5.2. NULL for OpenConfig."]
+  label         VARCHAR  [not null, note: "Human-readable display name. e.g. 'Cisco ASR9000 IOS-XR 7.5.2'."]
+  parse_status  ENUM     [not null, default: "Pending", note: "Pending | Parsing | Complete | Failed."]
+  parse_error   TEXT     [note: "NULL unless parse_status = Failed."]
+  file_count    INT      [not null, default: 0]
+  uploaded_at   DATETIME [not null]
+  uploaded_by   INT      [not null]
+
+  indexes {
+    (vendor, platform, os_version) [unique, name: "uq_bundle_version"]
+  }
+
+  note: "One row per vendor/platform/OS-version bundle. Deleting cascades to all its tlm_yang_models and tlm_yang_nodes. YM-01/YM-05/YM-06."
+}
+
+Ref: tlm_yang_version_bundles.uploaded_by > tlm_users.id
+
+Table tlm_yang_models {
+  id             INT      [pk, increment]
+  bundle_id      INT      [not null, note: "FK → tlm_yang_version_bundles."]
+  filename       VARCHAR  [not null]
+  module_name    VARCHAR  [not null, note: "Parsed from YANG 'module' statement."]
+  revision_date  VARCHAR  [note: "Parsed from YANG 'revision'. Format: YYYY-MM-DD."]
+  uploaded_at    DATETIME [not null]
+  uploaded_by    INT      [not null]
+
+  indexes {
+    (module_name, revision_date) [unique, name: "uq_yang_module_revision"]
+  }
+
+  note: "Registry of uploaded YANG model files. Each row is one .yang file. YM-01."
+}
+
+Ref: tlm_yang_models.bundle_id   > tlm_yang_version_bundles.id [delete: cascade]
+Ref: tlm_yang_models.uploaded_by > tlm_users.id
+
+Table tlm_yang_nodes {
+  id           INT      [pk, increment]
+  model_id     INT      [not null, note: "FK → tlm_yang_models."]
+  parent_id    INT      [note: "Self-referencing FK. NULL for root nodes."]
+  node_name    VARCHAR  [not null]
+  gnmi_xpath   TEXT     [not null, note: "Fully qualified gNMI XPath — copied to clipboard by YM-04."]
+  node_type    ENUM     [not null, note: "Container | List | Leaf | LeafList."]
+  data_type    VARCHAR  [note: "e.g. uint64, string, boolean. NULL for containers."]
+  description  TEXT
+  units        VARCHAR  [note: "e.g. bytes, milliseconds."]
+  is_telemetry TINYINT  [not null, default: 0, note: "1 = counter or gauge type — highlighted in YANG tree browser (YM-02)."]
+
+  note: "Parsed YANG model nodes. Self-referencing parent_id enables tree view in UI. gnmi_xpath is the value copied by the 'Copy Path' button. YM-02/YM-03/YM-04/YM-05."
+}
+
+Ref: tlm_yang_nodes.model_id  > tlm_yang_models.id [delete: cascade]
+Ref: tlm_yang_nodes.parent_id > tlm_yang_nodes.id  [delete: cascade]
+
+
+// ============================================================
+// CROSS-DATABASE LOGICAL REFERENCES  (not DBML Refs)
+// ============================================================
+// All enforced at application layer only — no DB-level FK across databases.
+//
+// MariaDB → MariaDB (cross-schema, same server):
+//   tlm_routers.cat_device_id         → cat_device.id          (external catalog)
+//   tlm_util_binding.metric_alias      → tlm_metric_aliases.alias_metric
+//   tlm_active_alerts.device_id        → cat_device.device_id   (external catalog)
+//   tlm_util_if_config (indirect)      → cat_interface.SPEED     (external catalog)
+//
+// MariaDB → ClickHouse:
+//   tlm_path_aliases.id                → [CH] tlm_metrics.path_id
+//   tlm_alert_rule.id                  → [CH] tlm_alert_history.rule_id
+//
+// ClickHouse → MariaDB (read-only references, never FK):
+//   tlm_metrics.device_id              → cat_device.device_id   (external catalog)
+//   tlm_metrics.path_id                → tlm_path_aliases.id
+//   tlm_*_utilization.device_id        → cat_device.device_id
+//   tlm_path_aliases_mirror.id         → tlm_path_aliases.id    (mirror source)
+//   tlm_metric_aliases_mirror.id       → tlm_metric_aliases.id  (mirror source)
+//   tlm_label_aliases_mirror.id        → tlm_label_aliases.id   (mirror source)
+//   tlm_filter_rules_mirror.id         → tlm_filter_rules.id    (mirror source)
+//   tlm_alert_history.rule_id          → tlm_alert_rule.id
+// ============================================================

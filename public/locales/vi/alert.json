@@ -1,0 +1,14 @@
+{
+  "title": "CẢNH BÁO",
+  "tab": {
+    "ruleList": "Danh sách Rule",
+    "activeAlerts": "Active Alerts",
+    "history": "Alert History"
+  },
+  "severity": {
+    "info": "Info",
+    "warning": "Warning",
+    "error": "Error",
+    "critical": "Critical"
+  }
+}

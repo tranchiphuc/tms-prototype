@@ -1,0 +1,57 @@
+{
+  "app": {
+    "title": "TMS Dashboard",
+    "subtitle": "Hệ thống quản lý Telemetry mạng"
+  },
+  "menu": {
+    "config": "Cấu Hình",
+    "flinkRules": "Flink Rule",
+    "derivedMetrics": "Derived Metrics",
+    "alert": "Cảnh Báo",
+    "monitor": "Giám Sát",
+    "pipeline": "Pipeline Monitor",
+    "data": "Dữ Liệu",
+    "dataExplorer": "Khám Phá Dữ Liệu"
+  },
+  "action": {
+    "search": "Tìm kiếm",
+    "add": "Thêm mới",
+    "edit": "Sửa",
+    "delete": "Xóa",
+    "save": "Lưu",
+    "cancel": "Hủy",
+    "preview": "Preview",
+    "rescan": "Rescan",
+    "export": "Xuất file",
+    "import": "Nhập",
+    "refresh": "Làm mới",
+    "close": "Đóng",
+    "confirm": "Xác nhận"
+  },
+  "status": {
+    "active": "Active",
+    "inactive": "Inactive",
+    "deprecated": "Deprecated",
+    "disabled": "Disabled"
+  },
+  "common": {
+    "modelCode": "Model Code",
+    "createdBy": "Người tạo",
+    "updatedAt": "Cập nhật lúc",
+    "createdAt": "Tạo lúc",
+    "pushedAt": "Đẩy lúc",
+    "priority": "Độ ưu tiên",
+    "stt": "STT",
+    "actions": "Hành động",
+    "all": "Tất cả",
+    "loading": "Đang tải...",
+    "noData": "Không có dữ liệu",
+    "paginatorReport": "Hiển thị {{first}} đến {{last}} trên tổng số {{totalRecords}} bản ghi"
+  },
+  "message": {
+    "refreshNote": "Có hiệu lực sau ~1 chu kỳ refresh Flink",
+    "saveSuccess": "Lưu thành công",
+    "deleteSuccess": "Xóa thành công",
+    "deleteConfirm": "Bạn có chắc muốn xóa (Deprecate) bản ghi này?"
+  }
+}

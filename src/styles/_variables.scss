@@ -1,0 +1,46 @@
+// ============================================================
+// Design tokens — IPMS 4.0 style (đồng bộ CLAUDE.md §7)
+// ============================================================
+
+// --- Nền & text ---
+$bg-page:           #f0f2f5;
+$bg-white:          #ffffff;
+$text-primary:      #262626;
+$text-secondary:    #595959;
+$text-muted:        #8c8c8c;
+$border-color:      #f0f0f0;
+$table-header-bg:   #fafafa;
+$table-row-hover:   #e6f7ff;
+
+// --- Primary / action ---
+$primary:           #1890ff;
+$sidebar-active-bg: #e6f7ff;
+
+// --- Action buttons (góc phải header) ---
+$btn-search:        #1890ff;
+$btn-add:           #52c41a;
+$btn-rescan:        #722ed1;
+$btn-export:        #fa8c16;
+$btn-import:        #1890ff;
+
+// --- Icon hành động trong bảng ---
+$icon-edit:         #52c41a;
+$icon-delete:       #ff4d4f;
+
+// --- Severity badge ---
+$severity-info:     #1890ff;
+$severity-warning:  #faad14;
+$severity-error:    #ff7a45;
+$severity-critical: #ff4d4f;
+
+// --- Font ---
+$font-size-table:      13px;
+$font-size-header:     13px;
+$font-size-page-title: 18px;
+$font-size-menu:       13px;
+$font-size-button:     13px;
+
+// --- Layout dimensions ---
+$sidebar-width:           210px;
+$sidebar-collapsed-width: 60px;
+$topbar-height:           56px;

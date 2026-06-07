@@ -1,0 +1,9 @@
+{
+  "title": "QUẢN LÝ FLINK RULE",
+  "tab": {
+    "pathAlias": "Path Alias",
+    "metricAlias": "Metric Alias",
+    "labelAlias": "Label Alias",
+    "filterRule": "Filter Rule"
+  }
+}

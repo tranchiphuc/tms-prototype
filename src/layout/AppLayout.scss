@@ -1,0 +1,70 @@
+@import "../styles/variables";
+
+.app-layout {
+  min-height: 100vh;
+}
+
+// Sidebar là position:fixed (ngoài flow) nên .app-main chỉ cần margin-left
+// + là block thường → tự rộng = 100vw - sidebar. KHÔNG dùng flex:1 ở đây
+// (flex:1 sẽ kéo width = 100vw rồi margin-left đẩy ra → tràn ngang 230px).
+.app-main {
+  margin-left: $sidebar-width;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  min-width: 0; // cho phép con co lại, bảng width:100% vừa khít, không tràn
+}
+
+.app-content {
+  flex: 1;
+  padding: 16px;
+  background: $bg-page;
+  min-width: 0;
+}
+
+// --- Trạng thái thu nhỏ sidebar ---
+// Sidebar width + margin-left của main co lại; nhãn/section title bị ẩn,
+// chỉ còn icon canh giữa. transition cho mượt.
+.app-sidebar,
+.app-main {
+  transition: width 0.18s ease, margin-left 0.18s ease;
+}
+
+.app-layout.collapsed {
+  .app-sidebar {
+    width: $sidebar-collapsed-width;
+
+    .sidebar-brand {
+      justify-content: center;
+      padding: 0;
+      span { display: none; }
+    }
+
+    .sidebar-section-title { display: none; }
+
+    .sidebar-item {
+      justify-content: center;
+      padding: 12px 0;
+      gap: 0;
+      border-left-width: 0;
+
+      span { display: none; }
+      i { font-size: 17px; }
+
+      &.active {
+        border-left-width: 0;
+        background: $sidebar-active-bg;
+      }
+    }
+
+    .sidebar-collapse-btn {
+      justify-content: center;
+      padding: 12px 0;
+      gap: 0;
+    }
+  }
+
+  .app-main {
+    margin-left: $sidebar-collapsed-width;
+  }
+}

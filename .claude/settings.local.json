@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm --version)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:3000)",
+      "Bash(curl -s -X POST http://localhost:3000)",
+      "Bash(pkill -f \"react-scripts\")",
+      "Bash(pkill -f \"node.*start\")",
+      "Bash(curl -s -o /dev/null -w \"port3000 status=%{http_code}\\\\n\" --max-time 3 http://localhost:3000)",
+      "Bash(break)",
+      "Bash(curl -s -o /dev/null -w \"status=%{http_code}\\\\n\" --max-time 5 http://localhost:3000)",
+      "Bash(curl -s -o /dev/null -w \"common.json=%{http_code}\\\\n\" --max-time 5 http://localhost:3000/locales/vi/common.json)",
+      "Bash(pkill -f \"node.*react\")",
+      "Bash(curl -s -o /dev/null -w \"after-kill status=%{http_code}\\\\n\" --max-time 3 http://localhost:3000)",
+      "Bash(cd *)",
+      "Bash(bash -c 'export NVM_DIR=\"$HOME/.nvm\"; . \"$NVM_DIR/nvm.sh\"; nvm use 16 >/dev/null; CI=true npm run build 2>&1 | grep -i \"compiled\\\\|fail\\\\|error\\\\|warning\" | head')"
+    ]
+  }
+}

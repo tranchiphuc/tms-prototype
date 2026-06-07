@@ -1,0 +1,214 @@
+@import "variables";
+
+// ============================================================
+// Common patterns dùng chung toàn app
+// ============================================================
+
+// --- Đồng nhất font-size PrimeReact theo design token (13px) ---
+// Inline style chỉ set root element; phần text thật nằm ở các phần tử
+// con (.p-button-label, .p-dropdown-label) nên phải override ở đây.
+.p-button {
+  font-size: $font-size-button;
+  .p-button-label {
+    font-size: $font-size-button;
+    white-space: nowrap; // không xuống dòng "Refresh / status"
+  }
+  .p-button-icon {
+    font-size: 14px;
+  }
+}
+
+.p-inputtext {
+  font-size: $font-size-table;
+}
+
+.p-dropdown {
+  .p-dropdown-label {
+    font-size: $font-size-table;
+    display: flex;
+    align-items: center;
+  }
+}
+.p-dropdown-panel .p-dropdown-item {
+  font-size: $font-size-table;
+}
+
+// Bảng list (rule) + bảng trong dialog (preview):
+// - table-layout:fixed + width:100% ⇒ bảng luôn vừa khít container (không tràn
+//   ngang, không bị cắt cột cuối).
+// - chuỗi dài không có khoảng trắng (YANG path) TỰ XUỐNG DÒNG trong ô thay vì
+//   bị ẩn bớt ký tự cuối.
+.rule-table,
+.preview-table {
+  // Lưới guard: dưới table-layout:fixed, used-width của table = MAX(100%, tổng
+  // width cột). Nếu tổng width cột > container, table ép rộng và ĐẨY TRÀN cả
+  // trang. overflow-x:auto trên wrapper biến phần dư thành cuộn NỘI BỘ bảng,
+  // trang không bao giờ tràn ngang (kể cả màn hình hẹp).
+  .p-datatable-wrapper {
+    overflow-x: auto;
+  }
+
+  table {
+    table-layout: fixed;
+    width: 100%;
+  }
+
+  .p-datatable-tbody > tr > td,
+  .p-datatable-thead > tr > th {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    white-space: normal;
+    vertical-align: top;
+  }
+}
+
+// --- Page container ---
+.page-container {
+  background: $bg-white;
+  border-radius: 4px;
+  padding: 16px;
+}
+
+.page-title {
+  font-size: $font-size-page-title;
+  font-weight: 600;
+  color: $text-primary;
+  margin: 0;
+  text-transform: uppercase;
+}
+
+// --- Header bar: title bên trái, action buttons bên phải ---
+.page-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+
+.page-actions {
+  display: flex;
+  gap: 8px;
+}
+
+// --- Action buttons màu sắc ---
+.btn-search  { background: $btn-search  !important; border-color: $btn-search  !important; }
+.btn-add     { background: $btn-add     !important; border-color: $btn-add     !important; }
+.btn-rescan  { background: $btn-rescan  !important; border-color: $btn-rescan  !important; }
+.btn-export  { background: $btn-export  !important; border-color: $btn-export  !important; }
+.btn-import  { background: $btn-import  !important; border-color: $btn-import  !important; }
+
+// --- DataTable pattern (PrimeReact v6) ---
+.p-datatable {
+  font-size: $font-size-table;
+
+  .p-datatable-thead > tr > th {
+    background: $table-header-bg;
+    color: $text-primary;
+    font-size: $font-size-header;
+    font-weight: 600;
+  }
+
+  .p-datatable-tbody > tr {
+    color: $text-primary;
+
+    &:hover {
+      background: $table-row-hover !important;
+    }
+  }
+}
+
+// Cột link (tên thiết bị, alias...) — màu primary, click được
+.cell-link {
+  color: $primary;
+  cursor: pointer;
+
+  &:hover { text-decoration: underline; }
+}
+
+// Tooltip PrimeReact: KHÔNG để text xuống dòng từng ký tự.
+// Tooltip portal ra ngoài bảng nhưng vẫn có thể bị bó hẹp → ép nowrap.
+.p-tooltip .p-tooltip-text {
+  white-space: nowrap;
+}
+
+// Cụm icon hành động trong bảng — gọn để 3 icon vừa cột (table-layout:fixed)
+.row-actions {
+  display: flex;
+  gap: 2px;
+  flex-wrap: nowrap;
+
+  .p-button.p-button-sm {
+    width: 2rem;
+    height: 2rem;
+    padding: 0;
+
+    .p-button-icon {
+      font-size: 14px;
+    }
+  }
+}
+
+// Icon hành động trong bảng
+.action-icon-btn {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+
+  &.edit  { color: $icon-edit   !important; }
+  &.delete { color: $icon-delete !important; }
+}
+
+// --- Warning box nổi bật (Filter Rule EXCLUDE, cascade...) ---
+.warning-box {
+  background: #fff7e6;
+  border: 1px solid #ffd591;
+  border-radius: 4px;
+  padding: 10px 12px;
+  color: #d46b08;
+  font-size: 13px;
+  margin: 8px 0;
+
+  &.danger {
+    background: #fff1f0;
+    border-color: #ffa39e;
+    color: #cf1322;
+  }
+}
+
+// --- Info box (ngữ nghĩa pct/no_data...) — xanh, phân biệt warning-box ---
+.info-box {
+  background: #e6f7ff;
+  border: 1px solid #91d5ff;
+  border-radius: 4px;
+  padding: 10px 12px;
+  color: #0958d9;
+  font-size: 13px;
+  margin: 8px 0;
+}
+
+// --- Form field spacing ---
+.field-row {
+  margin-bottom: 14px;
+
+  label {
+    display: block;
+    margin-bottom: 4px;
+    font-size: 13px;
+    color: $text-secondary;
+    font-weight: 500;
+  }
+
+  .field-hint {
+    display: block;
+    margin-top: 4px;
+    font-size: 12px;
+    color: $text-muted;
+  }
+
+  .field-error {
+    display: block;
+    margin-top: 4px;
+    font-size: 12px;
+    color: $icon-delete;
+  }
+}

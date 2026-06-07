@@ -1,0 +1,14 @@
+The data pipeline gồm 5 layers:
+- Source layer: 300 routers của 3 vendors Cisco, Juniper, Nokia, chạy giao thức gNMI dial-in protocol cho telemetry 
+- Ingestion layer: 3 instances of gNMIc running in cluster mode, run gNMI dial-in with routers 
+- Queuing layer: 3 instances of Kafka.
+- Processing layer: some instances of Apache Flink.
+- Storage layer: ClickHouse for storing metrics and historical alarms, MariaDB for others.
+
+Metric emission rate: 10000 metrics per router every 60 seconds.
+
+Các service hiện đang phát triển:
+- Flink service như file @01-flink_processing_hld_vi_v2.md
+- Resource utilization (Spring Boot) được mô tả trong file @02-resource_utilization_hld_vi_v3_1.md
+- Alert module (Spring Boot) được mô tả trong file @03-evaluation_engine_detail_vi_v1_0.md
+Các module khác sẽ được phát triển tiếp tục như observability, ...
