@@ -3,7 +3,7 @@ name: Deploy to Cloudflare Workers
 on:
   push:
     branches:
-      - main  # change this if your production branch has a different name
+      - main
 
 jobs:
   deploy:
@@ -23,6 +23,8 @@ jobs:
 
       - name: Build project
         run: npm run build
+        env:
+          NODE_OPTIONS: --openssl-legacy-provider   # 👈 add this
 
       - name: Setup Node 22 for Wrangler
         uses: actions/setup-node@v4
