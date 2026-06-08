@@ -13,11 +13,13 @@ const PathAliasTab = () => {
     {
       field: "original_path",
       header: "Original Path",
-      // không set width cố định → table-layout:fixed cấp phần còn lại cho cột này;
-      // chuỗi path dài tự xuống dòng (CSS .rule-table), không bị cắt ký tự.
+      // width tường minh để tổng width cột > vùng nội dung → bật thanh cuộn ngang
+      // (overflow-x:auto trên .rule-table) đồng nhất với Metric/Label Alias tab.
+      // chuỗi path dài vẫn tự xuống dòng (CSS .rule-table), không bị cắt ký tự.
+      style: { width: 500 },
       body: (r) => <span title={r.original_path}>{r.original_path}</span>,
     },
-    { field: "alias_path", header: "Alias Path", isLink: true, onLinkClick: tab.openEdit, style: { width: 200 } },
+    { field: "alias_path", header: "Alias Path", isLink: true, onLinkClick: tab.openEdit, style: { width: 260 } },
   ];
 
   return (

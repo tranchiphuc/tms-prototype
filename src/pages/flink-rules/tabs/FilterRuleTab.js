@@ -22,9 +22,11 @@ const FilterRuleTab = () => {
           <Tag value="INCLUDE" severity="success" />
         ),
     },
-    { field: "match_path", header: "match_path", body: (r) => r.match_path || <em style={{ color: "#8c8c8c" }}>mọi path</em> },
-    { field: "match_metric", header: "match_metric", body: (r) => r.match_metric || <em style={{ color: "#8c8c8c" }}>mọi metric</em> },
-    { field: "filter_expression", header: "Expression", body: (r) => r.filter_expression || <em style={{ color: "#8c8c8c" }}>luôn TRUE</em> },
+    // width tường minh cho mọi cột để tổng > vùng nội dung → bật thanh cuộn ngang
+    // (overflow-x:auto trên .rule-table) đồng nhất với Metric/Label Alias tab.
+    { field: "match_path", header: "match_path", style: { width: 240 }, body: (r) => r.match_path || <em style={{ color: "#8c8c8c" }}>mọi path</em> },
+    { field: "match_metric", header: "match_metric", style: { width: 200 }, body: (r) => r.match_metric || <em style={{ color: "#8c8c8c" }}>mọi metric</em> },
+    { field: "filter_expression", header: "Expression", style: { width: 280 }, body: (r) => r.filter_expression || <em style={{ color: "#8c8c8c" }}>luôn TRUE</em> },
     { field: "priority", header: "Priority", style: { width: 90 } },
   ];
 

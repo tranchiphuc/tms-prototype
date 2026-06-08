@@ -12,12 +12,15 @@ const LabelAliasTab = () => {
 
   const columns = [
     { field: "vendor_code", header: "Model Code", style: { width: 100 } },
-    { field: "original_key", header: "Original Key" },
+    // width tường minh cho mọi cột: dưới table-layout:fixed, cột thiếu width
+    // bị co về ~0 → header vỡ thành chữ dọc (xem PROGRESS Gotcha #3).
+    { field: "original_key", header: "Original Key", style: { width: 220 } },
     { field: "alias_key", header: "Alias Key", isLink: true, onLinkClick: tab.openEdit, style: { width: 160 } },
     { field: "lv_kind", header: "lv_kind", body: (r) => LV_LABEL[r.lv_kind], style: { width: 130 } },
     {
       field: "lv_pattern",
       header: "Pattern / Mapping",
+      style: { width: 260 },
       body: (r) =>
         r.lv_kind === 1
           ? <code style={{ fontSize: 12 }}>{r.lv_pattern} → {r.lv_replace}</code>
